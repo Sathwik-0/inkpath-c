@@ -97,8 +97,8 @@ export const ChapterSchema = z.object({
     )
     .min(2)
     .max(8),
-  hook: text(300),
-  summary: text(600), // appended to the rolling summary
+  hook: optText(300),
+  summary: optText(600).transform((s) => s ?? ""), // appended to the rolling summary
   new_threads: z
     .array(z.object({ label: text(200), concept_name: optText(120), due_by: num.min(1).nullish() }))
     .default([]),

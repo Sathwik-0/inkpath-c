@@ -90,9 +90,10 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
       else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
       else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
       await set({ status: "succeeded", progress: 100, step: "done" });
-    } catch (e) {
+    } catch (e: any) {
       const { code, message } = publicError(e);
-      console.error("job failed", job.id, a.type, code, e instanceof Error ? e.name : "error");
+      console.error("job failed", job.id, a.type, code, e?.message || e);
+      if (e?.stack) console.error(e.stack);
       // A failed free chapter must not use up the allowance.
       if (chapterId && a.funding === "platform") await admin.rpc("release_free_chapter", { p_user: a.userId, p_chapter: chapterId });
       if (chapterId) await admin.from("chapters").update({ status: "failed" }).eq("id", chapterId).neq("status", "ready");

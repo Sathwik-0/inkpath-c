@@ -87,7 +87,11 @@ export class GeminiProvider implements AIProvider {
 
   private textOf(data: any): string {
     const parts: Part[] = data?.candidates?.[0]?.content?.parts ?? [];
-    const text = parts.map((p) => (typeof p.text === "string" ? p.text : "")).join("");
+    // Gemini 2.5 Flash outputs thought parts marked with thought: true.
+    // Filter them out so internal reasoning tokens do not corrupt JSON or text extraction.
+    const nonThoughtParts = parts.filter((p: any) => !p?.thought);
+    const targetParts = nonThoughtParts.length > 0 ? nonThoughtParts : parts;
+    const text = targetParts.map((p) => (typeof p.text === "string" ? p.text : "")).join("");
     if (!text) {
       if (data?.promptFeedback?.blockReason) {
         throw new ProviderError("content_blocked", "Gemini blocked this request.");
@@ -101,7 +105,10 @@ export class GeminiProvider implements AIProvider {
     const data = await this.generate(MODELS.gemini.text, {
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: opts?.maxOutputTokens ?? 2048 },
+      generationConfig: {
+        maxOutputTokens: opts?.maxOutputTokens ?? 2048,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     });
     return this.textOf(data);
   }
@@ -125,6 +132,7 @@ export class GeminiProvider implements AIProvider {
           responseMimeType: "application/json",
           temperature: req.temperature ?? 0.7,
           maxOutputTokens: req.maxOutputTokens ?? 8192,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
       return this.textOf(data);

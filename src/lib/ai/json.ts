@@ -6,7 +6,15 @@ export function extractJson(raw: string): unknown {
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) s = fence[1].trim();
   const first = s.search(/[[{]/);
-  if (first > 0) s = s.slice(first);
+  if (first >= 0) {
+    const isArray = s[first] === "[";
+    const last = isArray ? s.lastIndexOf("]") : s.lastIndexOf("}");
+    if (last > first) {
+      s = s.slice(first, last + 1);
+    } else {
+      s = s.slice(first);
+    }
+  }
   return JSON.parse(s);
 }
 
@@ -18,6 +26,7 @@ export async function generateParsed<T>(
   generate: (correction?: string) => Promise<string>,
   parse: (raw: unknown) => T,
 ): Promise<T> {
+  let lastError: unknown = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const raw = await generate(
       attempt === 0
@@ -25,10 +34,14 @@ export async function generateParsed<T>(
         : "Your previous reply was not valid JSON matching the required shape. Reply with ONLY the corrected JSON.",
     );
     try {
-      return parse(extractJson(raw));
-    } catch {
+      const json = extractJson(raw);
+      return parse(json);
+    } catch (err) {
+      lastError = err;
+      console.warn(`[generateParsed] attempt ${attempt} parse failed:`, err instanceof Error ? err.message : err);
       // fall through and retry once
     }
   }
-  throw new ProviderError("bad_response", "The model returned data in an unexpected format.");
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new ProviderError("bad_response", `The model returned data in an unexpected format: ${detail}`);
 }
