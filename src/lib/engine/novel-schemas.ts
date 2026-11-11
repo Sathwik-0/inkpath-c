@@ -30,6 +30,15 @@ export const ConceptGraphSchema = z.object({
         misconceptions: list.transform((a) => a.slice(0, 3).map((s) => s.trim().slice(0, 200))),
         prerequisites: list, // names of other concepts in this list
         source_ref: optText(120),
+        citations: z
+          .array(
+            z.object({
+              source_id: z.string().default("S1"),
+              location: z.string().default(""),
+              quote: z.string().max(300).default(""),
+            }),
+          )
+          .default([]),
       }),
     )
     .min(1)
@@ -78,6 +87,8 @@ export const ChapterSchema = z.object({
       z.object({
         heading: text(120),
         text: text(4000),
+        /** Concepts this scene carries and teaches. */
+        teaches: list,
         /** Concepts the character must ACT on in this scene. */
         concepts_applied: list,
         /** How the concept changes what happens (not a restatement). */
@@ -99,6 +110,9 @@ export const VerifySchema = z.object({
   accurate: z.boolean(),
   every_concept_acted_on: z.boolean(),
   continuity_clean: z.boolean().default(true),
+  fact_boundaries_clean: z.boolean().default(true),
+  no_in_text_citations: z.boolean().default(true),
+  unsupported_facts: z.array(text(300)).default([]),
   problems: z.array(z.object({ concept_name: optText(120), issue: text(400) })).default([]),
   fix_instructions: optText(800),
 });
@@ -114,6 +128,7 @@ export const RecallSchema = z.object({
         explanation: text(500),
         concept_name: text(120),
         evidence: text(400).default(""),
+        source_quote: optText(400),
       }),
     )
     .min(1)

@@ -299,3 +299,4 @@ function formatMinutes(m: number): string {
   const rounded = Math.round(m * 10) / 10;
   return `${rounded} min`;
 }
+

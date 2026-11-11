@@ -79,3 +79,4 @@ export function ReadingTracker({ projectId, chapterNumber, estimatedMinutes, wor
     </div>
   );
 }
+

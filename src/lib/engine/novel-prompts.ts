@@ -21,7 +21,9 @@ export const BANNED_STOCK_PHRASES = [
 
 export const CONCEPT_GRAPH_SYSTEM = `You are an expert teacher and curriculum designer. Read the learning material and build a concept graph: what a learner must understand, and which concepts depend on which.
 Rules:
-- Be accurate and faithful to the material. Never invent facts. If the input is only a topic name, leave source_ref null and rely on well-established knowledge.
+- Be accurate and faithful to the material. Never invent facts.
+- Citations: For each concept, extract "citations": [{ "source_id": "S1", "location": "...", "quote": "..." }] where "quote" is a short VERBATIM excerpt (at most 25 words) directly copied from the source text.
+- If the input is only a topic name with no uploaded source, leave citations empty []. NEVER fabricate a URL, title, or page number.
 - Prefer 5-20 concepts. Sort the concepts by importance (most fundamental first).
 - Assign each concept a "complexity": 1 = simple (~3 min direct study), 2 = moderate (~6 min), 3 = hard (~10 min).
 - Assign an "importance" score from 1 (most critical) to 100.
@@ -44,7 +46,8 @@ export const CONCEPT_GRAPH_SHAPE = `Return JSON with exactly this shape:
     "importance": 1-100,
     "misconceptions": ["..."],
     "prerequisites": ["exact concept names"],
-    "source_ref": "page or timestamp or null"
+    "source_ref": "page or timestamp or null",
+    "citations": [{ "source_id": "S1", "location": "Page X", "quote": "verbatim quote <= 25 words" }]
   }]
 }`;
 
@@ -104,6 +107,10 @@ ${CRAFT_PRINCIPLES}
 Hard rules:
 - TEACH THROUGH ACTION: The concept must be something the character DOES. The protagonist attempts a solution, it fails because of the concept, and the character works out why. A mentor or sidekick may explain at most TWO sentences in a row. Never deliver long lecture blocks.
 - Introduce the core idea in the FIRST THIRD of the chapter, not at the end.
+- Teach the NEW concepts accurately and only as listed.
+- CLEAN PROSE: DO NOT put citation markers (such as [1], [S1], footnotes, page references) inside story prose. Keep the prose completely clean and immersive.
+- FACT BOUNDARIES: Maintain a strict boundary between story fiction (characters, settings, narrative events) and taught concepts. Taught facts must strictly match the concept definitions and source quotes. Never state technical claims that go beyond the concept definitions.
+- Each scene must return "teaches": the concept names it carries.
 - Obey the word target provided in the prompt. Do not write filler.
 - FORMATTING: Blank lines between paragraphs. Every line of dialogue starts a new paragraph. NO markdown, backticks or code formatting inside prose.
 - NEVER use banned stock phrases ("dust motes danced", "a breath held", "heart pounded", etc.).
@@ -115,7 +122,7 @@ Return JSON only.`;
 export const CHAPTER_SHAPE = `Return JSON:
 {
   "title",
-  "scenes":[{"heading","text","concepts_applied":["exact concept names"],"concept_action":"what the character does with the idea"}],
+  "scenes":[{"heading","text","teaches":["concept names this scene carries"],"concepts_applied":["exact concept names"],"concept_action":"what the character does with the idea"}],
   "hook":"the specific unanswered question the chapter ends on (unless this is the final chapter)",
   "summary":"3 sentences of what happened, for the story-so-far",
   "new_threads":[{"label","concept_name":"name or null","due_by":chapter number}],
@@ -176,12 +183,14 @@ export function buildChapterPrompt(i: ChapterPromptInput): string {
 }
 
 export const VERIFY_SYSTEM = `You are a strict story editor, continuity supervisor and fact-checker.
-Compare the chapter with the concept definitions, previous facts, and craft rules.
+Compare the chapter with the concept definitions, verified source quotes, previous facts, and craft rules.
 Check:
-1. accurate: Every statement about taught concepts matches the definition. No wrong claims.
+1. accurate: Every statement about taught concepts matches the definition and verified source text. No wrong claims.
 2. every_concept_acted_on: Each NEW concept appears in a scene where a character MUST apply it to solve or fail a concrete problem. FAILS if any new concept only appears as dialogue explanation from a mentor or friend.
 3. continuity_clean: Names, locations, facts, countdowns and numbers are consistent. For example, a countdown must count down, not up.
-4. check for banned stock phrases ("dust motes danced", "a breath held", "a life slipping away", "heart pounded").
+4. fact_boundaries_clean: Check fact boundaries. Characters and narrative are fictional, but technical facts must match concept definitions. FAILS if a scene states technical facts that are not in any concept definition and not clearly part of the fictional framing.
+5. no_in_text_citations: Story prose must be clean. FAILS if citation brackets like [1], [S1], or footnote markers appear in prose.
+6. check for banned stock phrases ("dust motes danced", "a breath held", "a life slipping away", "heart pounded").
 If any check fails, provide clear, actionable fix_instructions.
 Return JSON only.`;
 
@@ -190,6 +199,9 @@ export const VERIFY_SHAPE = `Return JSON:
   "accurate": boolean,
   "every_concept_acted_on": boolean,
   "continuity_clean": boolean,
+  "fact_boundaries_clean": boolean,
+  "no_in_text_citations": boolean,
+  "unsupported_facts": ["any technical claims that go beyond definitions"],
   "problems": [{"concept_name": "name or null", "issue": "specific description of issue"}],
   "fix_instructions": "short concrete instructions for the rewrite or null"
 }`;

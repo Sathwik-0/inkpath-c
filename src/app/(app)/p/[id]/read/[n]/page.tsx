@@ -4,6 +4,8 @@ import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { Recall } from "./Recall";
 import { ReadingTracker } from "./ReadingTracker";
+import { ChapterSources, ConceptSourceItem } from "./ChapterSources";
+import { parseStoredConceptSource } from "@/lib/engine/citations";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +13,7 @@ interface Scene {
   heading: string;
   text: string;
   concepts_applied?: string[];
+  teaches?: string[];
 }
 
 export default async function Reader({ params }: { params: Promise<{ id: string; n: string }> }) {
@@ -45,6 +48,40 @@ export default async function Reader({ params }: { params: Promise<{ id: string;
   const { count: total } = await supabase.from("chapters").select("id", { count: "exact", head: true }).eq("project_id", id);
   const scenes = (ch.prose as { scenes: Scene[] }).scenes;
 
+  // Retrieve project concepts to show citations & source references
+  const { data: allConcepts } = await supabase
+    .from("concepts")
+    .select("id,name,explanation,source_ref")
+    .eq("project_id", id);
+
+  // Taught concepts in this chapter
+  const taughtNamesOrIds = new Set<string>();
+  for (const s of scenes) {
+    (s.teaches ?? []).forEach((t) => taughtNamesOrIds.add(t.toLowerCase().trim()));
+    (s.concepts_applied ?? []).forEach((c) => taughtNamesOrIds.add(c.toLowerCase().trim()));
+  }
+
+  const rawChapterConcepts = (allConcepts ?? []).filter((c) => {
+    if (taughtNamesOrIds.size === 0) return true; // Show all if not explicitly partitioned
+    return taughtNamesOrIds.has(c.id.toLowerCase()) || taughtNamesOrIds.has(c.name.toLowerCase().trim());
+  });
+
+  const chapterConcepts: ConceptSourceItem[] = (
+    rawChapterConcepts.length > 0 ? rawChapterConcepts : (allConcepts ?? [])
+  ).map((c) => {
+    const meta = parseStoredConceptSource(c.source_ref);
+    return {
+      id: c.id,
+      name: c.name,
+      explanation: c.explanation,
+      citations: meta.citations,
+      isUnsourced: meta.isUnsourced,
+      statusLabel: meta.statusLabel,
+    };
+  });
+
+  const anyUnsourced = chapterConcepts.some((c) => c.isUnsourced || c.citations.length === 0);
+
   // Calculate words and estimated reading minutes (200 wpm)
   const wordCount = scenes.reduce((acc, s) => acc + s.text.trim().split(/\s+/).filter(Boolean).length, 0);
   const estimatedMinutes = Math.max(0.5, Math.round((wordCount / 200) * 10) / 10);
@@ -63,6 +100,16 @@ export default async function Reader({ params }: { params: Promise<{ id: string;
           wordCount={wordCount}
         />
       </div>
+
+      {/* Part 4.2: Fact boundary one-line note */}
+      <div className="mt-4 rounded-lg bg-surface-container-high/60 px-3 py-2 text-xs text-on-surface-variant border border-outline-variant/60">
+        {anyUnsourced ? (
+          <span>Concepts are from general knowledge. Check them against a trusted source.</span>
+        ) : (
+          <span>Characters and events are fictional. The concepts are from your source.</span>
+        )}
+      </div>
+
       <p className="mt-6 font-label-sm text-label-sm uppercase text-tertiary">Chapter {ch.number}</p>
       <h1 className="mt-1 font-headline-lg-mobile text-headline-lg-mobile md:font-headline-lg md:text-headline-lg">
         {ch.title}
@@ -91,6 +138,10 @@ export default async function Reader({ params }: { params: Promise<{ id: string;
           Our fact-check flagged this chapter. Double-check key claims against your source before relying on it.
         </p>
       )}
+
+      {/* Part 3.2: Sources section after chapter */}
+      <ChapterSources concepts={chapterConcepts} />
+
       <Recall chapterId={ch.id} questions={questions} projectId={id} next={num < (total ?? 0) ? num + 1 : null} />
     </article>
   );

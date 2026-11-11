@@ -116,3 +116,4 @@ describe("Time Budget (Part B)", () => {
     expect(budget.omittedConcepts[0].reason).toContain("12-chapter time budget");
   });
 });
+

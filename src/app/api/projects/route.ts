@@ -1,8 +1,14 @@
 import { z } from "zod";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { currentUser, fail, json } from "@/lib/api";
-import { MAX_UPLOAD_BYTES, chunkText, extractText, kindFromName } from "@/lib/engine/ingest";
+import {
+  MAX_UPLOAD_BYTES,
+  extractText,
+  extractChunksWithLocations,
+  kindFromName,
+} from "@/lib/engine/ingest";
 import { parseStorySettings } from "@/lib/engine/settings";
+import type { SourceMapping } from "@/lib/engine/citations";
 
 export const maxDuration = 60;
 
@@ -65,6 +71,7 @@ export async function POST(req: Request) {
   const validatedSettings = parseStorySettings(fields.settings);
 
   let extracted = "";
+  let fileBuffer: Buffer | undefined = undefined;
   let kind: "pdf" | "docx" | "txt" | "text" | "youtube" | "topic";
   let sourceTitle = fields.title || fields.topic || "Untitled";
   if (file) {
@@ -74,7 +81,8 @@ export async function POST(req: Request) {
     kind = k;
     sourceTitle = fields.title || file.name.replace(/\.[^.]+$/, "");
     try {
-      extracted = (await extractText(k, Buffer.from(await file.arrayBuffer()))).trim();
+      fileBuffer = Buffer.from(await file.arrayBuffer());
+      extracted = (await extractText(k, fileBuffer)).trim();
     } catch {
       return fail("We could not read that file. Try a different export or paste the text.", 422);
     }
@@ -91,6 +99,19 @@ export async function POST(req: Request) {
     return fail("Add a topic, some text, a YouTube link or a file.", 400);
   }
 
+  // Part 1: Give each source a short id (S1, S2...) with title, type, and URL or file name
+  const sourceMapping: SourceMapping = {
+    sourceId: "S1",
+    title: sourceTitle,
+    type: kind,
+    urlOrFilename: file?.name || fields.youtube || fields.title || (kind === "topic" ? fields.topic || "General Knowledge" : "Pasted Text"),
+  };
+
+  const projectSettings = {
+    ...validatedSettings,
+    sources: [sourceMapping],
+  };
+
   const { data: project, error } = await admin
     .from("projects")
     .insert({
@@ -98,7 +119,7 @@ export async function POST(req: Request) {
       title: sourceTitle,
       subject: fields.topic ?? sourceTitle,
       genre: validatedSettings.genre !== "auto" ? validatedSettings.genre : undefined,
-      settings: validatedSettings,
+      settings: projectSettings,
     })
     .select("id").single();
   if (error || !project) return fail("Could not create the project.", 500);
@@ -110,13 +131,21 @@ export async function POST(req: Request) {
       url: fields.youtube ?? null, status: "ready",
     })
     .select("id").single();
-  if (source && extracted) {
-    const chunks = chunkText(extracted);
-    await admin.from("extracted_content").insert(
-      chunks.map((content, i) => ({
-        user_id: auth.user.id, project_id: project.id, source_id: source.id, chunk_index: i, content,
-      })),
-    );
+
+  if (source && (extracted || fileBuffer)) {
+    const chunks = await extractChunksWithLocations(kind, fileBuffer, extracted);
+    if (chunks.length > 0) {
+      await admin.from("extracted_content").insert(
+        chunks.map((c, i) => ({
+          user_id: auth.user.id,
+          project_id: project.id,
+          source_id: source.id,
+          chunk_index: i,
+          content: c.content,
+          location: c.location,
+        })),
+      );
+    }
   }
   return json({ id: project.id }, 201);
 }

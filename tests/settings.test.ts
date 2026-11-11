@@ -72,3 +72,4 @@ describe("Story Settings (Part A)", () => {
     expect(parsed.language).toBe("Japanese");
   });
 });
+

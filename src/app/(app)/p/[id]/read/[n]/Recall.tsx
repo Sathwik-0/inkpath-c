@@ -7,16 +7,21 @@ interface Q { prompt: string; options: string[]; concept: string }
 interface Result {
   score: number; total: number;
   concepts: { name: string; correct: boolean; level: number }[];
-  review: { correct: boolean; correctIndex: number; explanation: string }[];
+  review: { correct: boolean; correctIndex: number; explanation: string; evidence?: string; sourceQuote?: string }[];
 }
 
 export function Recall({ chapterId, questions, projectId, next }: { chapterId: string; questions: Q[]; projectId: string; next: number | null }) {
   const [answers, setAnswers] = useState<(number | null)[]>(questions.map(() => null));
   const [result, setResult] = useState<Result | null>(null);
+  const [showSource, setShowSource] = useState<Record<number, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   if (!questions.length) return null;
   const ready = answers.every((a) => a !== null);
+
+  const toggleSource = (idx: number) => {
+    setShowSource((prev) => ({ ...prev, [idx]: !prev[idx] }));
+  };
 
   async function submit() {
     setBusy(true); setError("");
@@ -47,7 +52,30 @@ export function Recall({ chapterId, questions, projectId, next }: { chapterId: s
                 );
               })}
             </div>
-            {result && <p className="mt-2 text-body-md text-on-surface-variant">{result.review[i].explanation}</p>}
+            {result && (
+              <div className="mt-3 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-body-md text-on-surface-variant flex-1">{result.review[i].explanation}</p>
+                  {(result.review[i].sourceQuote || result.review[i].evidence) && (
+                    <button
+                      type="button"
+                      onClick={() => toggleSource(i)}
+                      className="rounded border border-outline-variant px-2 py-0.5 text-xs text-primary hover:bg-surface-container-high transition"
+                    >
+                      {showSource[i] ? "Hide Source" : "Source"}
+                    </button>
+                  )}
+                </div>
+                {showSource[i] && (result.review[i].sourceQuote || result.review[i].evidence) && (
+                  <div className="rounded-lg bg-surface-container-high p-3 text-body-sm border-l-2 border-primary">
+                    <p className="text-xs font-semibold uppercase text-tertiary">Source Quote</p>
+                    <blockquote className="mt-1 italic text-on-surface">
+                      “{result.review[i].sourceQuote || result.review[i].evidence}”
+                    </blockquote>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ))}
       </div>

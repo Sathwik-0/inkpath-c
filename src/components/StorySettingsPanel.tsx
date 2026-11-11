@@ -267,3 +267,4 @@ export function StorySettingsPanel({ settings, onChange, disabled = false, readO
 function capitalize(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
+

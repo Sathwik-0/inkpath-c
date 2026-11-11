@@ -7,6 +7,12 @@ import { sourceBlock } from "./prompts";
 import { parseStorySettings, type StorySettings } from "./settings";
 import { calculateTimeBudget, type TimeBudget } from "./budget";
 import {
+  validateConceptCitations,
+  parseStoredCitations,
+  type SourceMapping,
+  type ConceptCitation,
+} from "./citations";
+import {
   BibleSchema,
   ChapterSchema,
   ConceptGraphSchema,
@@ -131,22 +137,50 @@ export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: s
   const activeNameSet = new Set(budget.activeConcepts.map((c) => norm(c.name)));
   const conceptsToInsert = graph.concepts.filter((c) => activeNameSet.has(norm(c.name)));
 
+  // Validate citations in code (Part 2)
+  const rawSources: SourceMapping[] = (project.settings as any)?.sources ?? [
+    {
+      sourceId: "S1",
+      title: project.title ?? "Source document",
+      type: isTopicOnly ? "topic" : "text",
+      urlOrFilename: isTopicOnly ? "General Knowledge" : "Source Document",
+    },
+  ];
+
+  const conceptCitations: Record<string, any> = {};
+  for (const c of conceptsToInsert) {
+    const validated = validateConceptCitations(
+      (c as any).citations,
+      chunks ?? [],
+      rawSources,
+      isTopicOnly,
+    );
+    conceptCitations[c.name] = validated;
+  }
+
   // Re-running replaces previous graph
   await admin.from("concepts").delete().eq("project_id", projectId);
   const { data: inserted, error } = await admin
     .from("concepts")
     .insert(
-      conceptsToInsert.map((c, i) => ({
-        user_id: userId,
-        project_id: projectId,
-        name: c.name,
-        explanation: c.explanation,
-        objective: c.objective,
-        kind: c.kind,
-        misconceptions: c.misconceptions,
-        source_ref: c.source_ref,
-        position: i,
-      })),
+      conceptsToInsert.map((c, i) => {
+        const citationData = conceptCitations[c.name] ?? {
+          citations: [],
+          isUnsourced: true,
+          statusLabel: "unsourced",
+        };
+        return {
+          user_id: userId,
+          project_id: projectId,
+          name: c.name,
+          explanation: c.explanation,
+          objective: c.objective,
+          kind: c.kind,
+          misconceptions: c.misconceptions,
+          source_ref: JSON.stringify(citationData),
+          position: i,
+        };
+      }),
     )
     .select("id,name");
   if (error || !inserted) fail("Could not save concepts");
@@ -166,6 +200,8 @@ export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: s
 
   const updatedSettings = {
     ...settings,
+    sources: rawSources,
+    conceptCitations,
     budget,
   };
 
@@ -317,7 +353,7 @@ export async function stageChapter(
   ] = await Promise.all([
     admin.from("projects").select("settings").eq("id", projectId).single(),
     admin.from("story_bibles").select("bible,rolling_summary").eq("project_id", projectId).eq("user_id", userId).single(),
-    admin.from("concepts").select("id,name,explanation,misconceptions,world_rule,position").eq("project_id", projectId).order("position"),
+    admin.from("concepts").select("id,name,explanation,misconceptions,world_rule,position,source_ref").eq("project_id", projectId).order("position"),
     admin.from("concept_edges").select("from_concept,to_concept").eq("project_id", projectId),
     admin.from("learner_concepts").select("*").eq("project_id", projectId).eq("user_id", userId),
     admin.from("story_threads").select("*").eq("project_id", projectId).eq("status", "open"),
@@ -371,7 +407,18 @@ export async function stageChapter(
   });
 
   const conceptDetails = Object.fromEntries(
-    concepts.map((c) => [c.name, { explanation: c.explanation ?? "", world_rule: c.world_rule, misconceptions: c.misconceptions ?? [] }]),
+    concepts.map((c) => {
+      const citations = parseStoredCitations(c.source_ref);
+      return [
+        c.name,
+        {
+          explanation: c.explanation ?? "",
+          world_rule: c.world_rule,
+          misconceptions: c.misconceptions ?? [],
+          citations,
+        },
+      ];
+    }),
   );
 
   const basePrompt = {
@@ -397,22 +444,39 @@ export async function stageChapter(
   const verify = (ch: Chapter) => {
     const fullText = ch.scenes.map((s) => s.text).join("\n\n");
     const stockPhrases = findStockPhrases(fullText);
+    const hasInTextCitations = /\[(?:S?\d+|p(?:age)?\.?\s*\d+)\]/i.test(fullText);
 
     return provider.generateJson({
       system: VERIFY_SYSTEM,
-      prompt: `CONCEPT DEFINITIONS\n${[...brief.newConcepts, ...brief.reviewConcepts]
-        .map((c) => `- ${c.name}: ${conceptDetails[c.name]?.explanation}`)
+      prompt: `CONCEPT DEFINITIONS AND QUOTED SOURCE TEXT\n${[...brief.newConcepts, ...brief.reviewConcepts]
+        .map((c) => {
+          const d = conceptDetails[c.name];
+          const quotes = (d?.citations ?? []).map((ci: any) => `"${ci.quote}" (${ci.location})`).join("; ");
+          return `- ${c.name}: ${d?.explanation ?? ""}${quotes ? ` [Source: ${quotes}]` : ""}`;
+        })
         .join("\n")}\n\nNEW CONCEPTS THAT MUST BE ACTED ON: ${required.join(", ") || "none"}\n\nSTORY SO FAR (FOR CONTINUITY)\n${
         bibleRow.rolling_summary || "Chapter 1"
       }\n\nCHAPTER PROSE\n${JSON.stringify(ch)}\n\n${
         stockPhrases.length > 0 ? `BANNED PHRASES FOUND: ${stockPhrases.join(", ")}\n\n` : ""
-      }${VERIFY_SHAPE}`,
+      }${hasInTextCitations ? "FOUND IN-TEXT CITATIONS IN PROSE (story prose must not contain bracketed citation markers like [1] or [S1]).\n\n" : ""}${VERIFY_SHAPE}`,
       parse: (raw) => {
         const v = VerifySchema.parse(raw);
         if (stockPhrases.length > 0) {
           v.problems.push({
             concept_name: null,
             issue: `Contains banned stock phrases: ${stockPhrases.join(", ")}`,
+          });
+        }
+        if (hasInTextCitations || v.no_in_text_citations === false) {
+          v.problems.push({
+            concept_name: null,
+            issue: `Contains in-text citation markers in story prose. Prose must remain clean.`,
+          });
+        }
+        if (v.fact_boundaries_clean === false && v.unsupported_facts?.length) {
+          v.problems.push({
+            concept_name: null,
+            issue: `Contains technical facts going beyond concept definitions: ${v.unsupported_facts.join(", ")}`,
           });
         }
         return v;
@@ -428,6 +492,7 @@ export async function stageChapter(
   chapter.scenes = chapter.scenes.map((s) => ({
     ...s,
     text: sanitizeStoryProse(s.text),
+    teaches: s.teaches && s.teaches.length > 0 ? s.teaches : s.concepts_applied || [],
   }));
 
   // Part B.9: Trim pass if over 15% above target
@@ -445,15 +510,22 @@ export async function stageChapter(
       chapter.scenes = chapter.scenes.map((s) => ({
         ...s,
         text: sanitizeStoryProse(s.text),
+        teaches: s.teaches && s.teaches.length > 0 ? s.teaches : s.concepts_applied || [],
       }));
     } catch {
       // Keep chapter if trim pass fails parse
     }
   }
 
-  // Verifier check (Accuracy, Concept Acted On, Continuity, Stock phrases)
+  // Verifier check (Accuracy, Concept Acted On, Continuity, Fact Boundaries, Stock phrases)
   let check = await verify(chapter);
-  let verified = check.accurate && check.every_concept_acted_on && (check.continuity_clean ?? true) && check.problems.length === 0;
+  let verified =
+    check.accurate &&
+    check.every_concept_acted_on &&
+    (check.continuity_clean ?? true) &&
+    (check.fact_boundaries_clean ?? true) &&
+    (check.no_in_text_citations ?? true) &&
+    check.problems.length === 0;
 
   if (!verified) {
     // One revision pass with specific fix instructions (Part C.5)
@@ -578,8 +650,18 @@ export async function stageChapter(
     });
   }
 
+  // Attach concept source quote and chapter evidence to questions
+  const questionsWithSources = recall.questions.map((q) => {
+    const cDetails = conceptDetails[q.concept_name];
+    const sourceQuote = q.source_quote || cDetails?.citations?.[0]?.quote || undefined;
+    return {
+      ...q,
+      source_quote: sourceQuote,
+    };
+  });
+
   await admin.from("quizzes").upsert(
-    { user_id: userId, chapter_id: chapterRow.id, questions: recall.questions },
+    { user_id: userId, chapter_id: chapterRow.id, questions: questionsWithSources },
     { onConflict: "chapter_id" },
   );
 
@@ -592,7 +674,7 @@ export interface RecallResult {
   score: number;
   total: number;
   concepts: { name: string; correct: boolean; level: number; nextReviewAt: string | null }[];
-  review: { correct: boolean; correctIndex: number; explanation: string; evidence?: string }[];
+  review: { correct: boolean; correctIndex: number; explanation: string; evidence?: string; sourceQuote?: string }[];
 }
 
 /** Grades answers on the server so the correct index is never trusted from the client. */
@@ -689,7 +771,8 @@ export async function recordRecall(
     correct: answers[i] === q.correct_index,
     correctIndex: q.correct_index,
     explanation: q.explanation ?? "",
-    evidence: q.evidence ?? "",
+    evidence: (q as any).evidence ?? "",
+    sourceQuote: (q as any).source_quote ?? "",
   }));
   return { score, total: questions.length, concepts: out, review };
 }

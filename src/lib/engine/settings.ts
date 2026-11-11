@@ -188,3 +188,4 @@ export function parseStorySettings(input: unknown): StorySettings {
   if (result.success) return result.data;
   return { ...DEFAULT_STORY_SETTINGS };
 }
+
