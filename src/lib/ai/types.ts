@@ -1,11 +1,12 @@
-export type ProviderName = "gemini" | "openai" | "anthropic";
+export type ProviderName = "gemini" | "openai" | "anthropic" | "groq";
 
-export const PROVIDERS: ProviderName[] = ["gemini", "openai", "anthropic"];
+export const PROVIDERS: ProviderName[] = ["gemini", "openai", "anthropic", "groq"];
 
 export const PROVIDER_LABEL: Record<ProviderName, string> = {
   gemini: "Google Gemini",
   openai: "OpenAI",
   anthropic: "Anthropic Claude",
+  groq: "Groq",
 };
 
 /** Source material that a provider can read natively (Gemini only). */

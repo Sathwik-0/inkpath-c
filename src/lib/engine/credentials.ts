@@ -27,7 +27,7 @@ export interface ResolvedProvider {
   funding: Funding;
 }
 
-const TEXT_FALLBACK_ORDER: ProviderName[] = ["gemini", "anthropic", "openai"];
+const TEXT_FALLBACK_ORDER: ProviderName[] = ["gemini", "anthropic", "openai", "groq"];
 
 /**
  * Picks the key that pays for a job. The funding source is decided once when

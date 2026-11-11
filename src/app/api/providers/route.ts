@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { currentUser, fail, json } from "@/lib/api";
-import { PROVIDERS, ProviderError, createProvider, userMessage, PROVIDER_LABEL } from "@/lib/ai";
+import { PROVIDERS, ProviderError, createProvider, userMessage, PROVIDER_LABEL, type ProviderName } from "@/lib/ai";
 import { MODELS } from "@/lib/ai/config";
 import { keyAad, maskKey, sealSecret } from "@/lib/crypto";
 
@@ -27,7 +27,7 @@ export async function POST(req: Request) {
   if (!auth) return fail("Please sign in.", 401);
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return fail("That does not look like an API key. Paste the whole key with no spaces.", 400);
-  const { provider: name, key } = parsed.data as { provider: "gemini" | "openai" | "anthropic"; key: string };
+  const { provider: name, key } = parsed.data as { provider: ProviderName; key: string };
 
   let models: string[] = [];
   try {

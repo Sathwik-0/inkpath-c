@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { classifyGemini } from "@/lib/ai/gemini";
 import { classifyOpenAI } from "@/lib/ai/openai";
 import { classifyAnthropic } from "@/lib/ai/anthropic";
+import { classifyGroq } from "@/lib/ai/groq";
 import { redact } from "@/lib/ai/http";
 import { extractJson } from "@/lib/ai/json";
 
@@ -41,6 +42,11 @@ describe("other providers", () => {
   });
   it("Anthropic low credit is quota_exceeded", () => {
     expect(classifyAnthropic(400, "Your credit balance is too low", h).code).toBe("quota_exceeded");
+  });
+  it("Groq handles invalid key and rate limit", () => {
+    expect(classifyGroq(401, '{"error":{"message":"Invalid API Key"}}', h).code).toBe("invalid_key");
+    expect(classifyGroq(429, '{"error":{"message":"Rate limit reached"}}', h).code).toBe("rate_limited");
+    expect(classifyGroq(429, '{"error":{"code":"insufficient_quota"}}', h).code).toBe("quota_exceeded");
   });
 });
 

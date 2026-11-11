@@ -7,6 +7,7 @@ const PROVIDERS = [
   { id: "gemini", name: "Google Gemini", help: "Create a key at aistudio.google.com/apikey. Free keys work for text; illustrated images need billing." },
   { id: "openai", name: "OpenAI", help: "Create a key at platform.openai.com/api-keys." },
   { id: "anthropic", name: "Anthropic Claude", help: "Create a key at console.anthropic.com." },
+  { id: "groq", name: "Groq", help: "Create a key at console.groq.com/keys for ultra-fast Llama models." },
 ];
 
 export function Keys({ connections }: { connections: { provider: string; key_mask: string; status: string }[] }) {

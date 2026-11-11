@@ -27,4 +27,9 @@ export const MODELS = {
       return process.env.ANTHROPIC_TEXT_MODEL || "claude-sonnet-5-5";
     },
   },
+  groq: {
+    get text() {
+      return process.env.GROQ_TEXT_MODEL || "llama-3.3-70b-versatile";
+    },
+  },
 } as const;
