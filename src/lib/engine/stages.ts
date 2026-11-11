@@ -4,6 +4,8 @@ import type { AIProvider } from "@/lib/ai";
 import { NEW_STATE, applyReview, levelFor, type MemoryState } from "@/lib/learning/scheduler";
 import { planChapter, type ChapterBrief } from "@/lib/learning/planner";
 import { sourceBlock } from "./prompts";
+import { parseStorySettings, type StorySettings } from "./settings";
+import { calculateTimeBudget, type TimeBudget } from "./budget";
 import {
   BibleSchema,
   ChapterSchema,
@@ -12,14 +14,17 @@ import {
   VerifySchema,
   type Bible,
   type Chapter,
+  type Recall,
 } from "./novel-schemas";
 import {
   BIBLE_SYSTEM,
+  BANNED_STOCK_PHRASES,
   CHAPTER_SYSTEM,
   CONCEPT_GRAPH_SHAPE,
   CONCEPT_GRAPH_SYSTEM,
   RECALL_SHAPE,
   RECALL_SYSTEM,
+  TRIM_SYSTEM,
   VERIFY_SHAPE,
   VERIFY_SYSTEM,
   bibleShape,
@@ -34,11 +39,39 @@ function fail(message: string): never {
   throw new Error(message);
 }
 
+export function countWords(ch: Chapter): number {
+  return ch.scenes.reduce((acc, s) => acc + s.text.trim().split(/\s+/).filter(Boolean).length, 0);
+}
+
+export function sanitizeStoryProse(raw: string): string {
+  let s = raw.replace(/```[\s\S]*?```/g, "").replace(/`([^`]+)`/g, "$1");
+  s = s.replace(/^#{1,6}\s+/gm, "");
+  // Break into paragraphs and ensure dialogue starts on its own paragraph
+  const paragraphs = s
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return paragraphs.join("\n\n");
+}
+
+function findStockPhrases(text: string): string[] {
+  const lower = text.toLowerCase();
+  const found: string[] = [];
+  for (const phrase of BANNED_STOCK_PHRASES) {
+    if (lower.includes(phrase)) {
+      found.push(phrase);
+    }
+  }
+  return found;
+}
+
 /* ------------------------------------------------------------ 1. analyze */
 
 export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: string, projectId: string) {
   const { data: project } = await admin.from("projects").select("*").eq("id", projectId).eq("user_id", userId).single();
   if (!project) fail("Project not found");
+
+  const settings: StorySettings = parseStorySettings(project.settings);
 
   const { data: chunks } = await admin
     .from("extracted_content")
@@ -50,27 +83,60 @@ export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: s
   if (isTopicOnly) source = `Topic: ${project.subject ?? project.title}`;
 
   const { data: yt } = await admin
-    .from("source_documents").select("url").eq("project_id", projectId).eq("kind", "youtube").not("url", "is", null).limit(1);
+    .from("source_documents")
+    .select("url")
+    .eq("project_id", projectId)
+    .eq("kind", "youtube")
+    .not("url", "is", null)
+    .limit(1);
   const youtubeUrl = yt?.[0]?.url as string | undefined;
   if (youtubeUrl && isTopicOnly && provider.name !== "gemini")
     fail("YouTube links need a Google Gemini key. Paste the transcript as text, or connect Gemini.");
   if (youtubeUrl && isTopicOnly) source = "Learn from the attached YouTube video.";
 
+  const settingsGuidance = [
+    settings.genre !== "auto" ? `Preferred genre: ${settings.genre}.` : "",
+    settings.learnerLevel ? `Learner level: ${settings.learnerLevel}.` : "",
+    settings.depth ? `Depth: ${settings.depth}.` : "",
+    settings.language ? `Language: ${settings.language}.` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   const graph = await provider.generateJson({
     system: CONCEPT_GRAPH_SYSTEM,
     attachments: youtubeUrl && isTopicOnly ? [{ kind: "youtube", url: youtubeUrl }] : undefined,
-    prompt: `${isTopicOnly && !youtubeUrl ? source : sourceBlock(source)}\n\n${CONCEPT_GRAPH_SHAPE}`,
+    prompt: `${settingsGuidance ? `User Preferences: ${settingsGuidance}\n\n` : ""}${isTopicOnly && !youtubeUrl ? source : sourceBlock(source)}\n\n${CONCEPT_GRAPH_SHAPE}`,
     parse: (raw) => ConceptGraphSchema.parse(raw),
     maxOutputTokens: 8000,
     temperature: 0.3,
   });
 
-  // Re-running replaces the previous graph.
+  // Calculate strict time budget
+  const wordCount = isTopicOnly ? undefined : source.split(/\s+/).filter(Boolean).length;
+  const budget: TimeBudget = calculateTimeBudget({
+    sourceKind: isTopicOnly ? "topic" : "text",
+    sourceWordCount: wordCount,
+    concepts: graph.concepts.map((c, i) => ({
+      name: c.name,
+      complexity: c.complexity,
+      importance: c.importance ?? i + 1,
+    })),
+    depth: settings.depth,
+    learnerLevel: settings.learnerLevel,
+    reductionFactor: settings.reductionFactor,
+  });
+
+  // Filter to active concepts that fit within the 12-chapter budget
+  const activeNameSet = new Set(budget.activeConcepts.map((c) => norm(c.name)));
+  const conceptsToInsert = graph.concepts.filter((c) => activeNameSet.has(norm(c.name)));
+
+  // Re-running replaces previous graph
   await admin.from("concepts").delete().eq("project_id", projectId);
   const { data: inserted, error } = await admin
     .from("concepts")
     .insert(
-      graph.concepts.map((c, i) => ({
+      conceptsToInsert.map((c, i) => ({
         user_id: userId,
         project_id: projectId,
         name: c.name,
@@ -87,7 +153,7 @@ export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: s
 
   const idByName = new Map(inserted.map((c) => [norm(c.name), c.id as string]));
   const edges: { user_id: string; project_id: string; from_concept: string; to_concept: string }[] = [];
-  for (const c of graph.concepts) {
+  for (const c of conceptsToInsert) {
     const to = idByName.get(norm(c.name));
     for (const p of c.prerequisites) {
       const from = idByName.get(norm(p));
@@ -96,17 +162,31 @@ export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: s
   }
   if (edges.length) await admin.from("concept_edges").insert(edges);
 
+  const recommendedGenre = settings.genre !== "auto" ? settings.genre : graph.recommended_genre;
+
+  const updatedSettings = {
+    ...settings,
+    budget,
+  };
+
   await admin
     .from("projects")
     .update({
       title: project.title || graph.title,
-      genre: graph.recommended_genre,
+      genre: recommendedGenre,
       synopsis: graph.summary,
-      estimated_chapters: graph.estimated_chapters,
+      estimated_chapters: budget.chapterCount,
+      settings: updatedSettings,
       status: "analyzed",
     })
     .eq("id", projectId);
-  return { concepts: inserted.length, chapters: graph.estimated_chapters, genre: graph.recommended_genre };
+
+  return {
+    concepts: inserted.length,
+    chapters: budget.chapterCount,
+    genre: recommendedGenre,
+    budget,
+  };
 }
 
 /* -------------------------------------------------------------- 2. bible */
@@ -121,17 +201,25 @@ export async function stageBible(admin: Admin, provider: AIProvider, userId: str
     .order("position");
   if (!concepts?.length) fail("Analyze the material first");
 
-  const genre = project.genre ?? "adventure";
+  const settings: StorySettings = parseStorySettings(project.settings);
+  const genre = settings.genre !== "auto" ? settings.genre : project.genre ?? "adventure";
   const chapters = project.estimated_chapters ?? 3;
+
   const bible = await provider.generateJson({
     system: BIBLE_SYSTEM,
     prompt: `CONCEPTS TO TEACH (in dependency order)\n${concepts
       .map((c) => `- ${c.name}: ${c.explanation}`)
-      .join("\n")}\n\n${bibleShape(genre, chapters)}`,
+      .join("\n")}\n\n${bibleShape(genre, chapters, settings)}`,
     parse: (raw) => BibleSchema.parse(raw),
     maxOutputTokens: 8000,
     temperature: 0.9,
   });
+
+  // If user selected Auto for setting fields, record the chosen values into settings so future chapters stay consistent
+  const resolvedSettings = {
+    ...settings,
+    genre: settings.genre === "auto" ? bible.genre : settings.genre,
+  };
 
   await admin.from("story_bibles").upsert({
     project_id: projectId,
@@ -159,11 +247,55 @@ export async function stageBible(admin: Admin, provider: AIProvider, userId: str
       status: "outline",
     })),
   );
-  await admin.from("projects").update({ title: bible.title, synopsis: bible.logline, status: "previewed" }).eq("id", projectId);
+
+  await admin
+    .from("projects")
+    .update({
+      title: bible.title,
+      synopsis: bible.logline,
+      settings: resolvedSettings,
+      status: "previewed",
+    })
+    .eq("id", projectId);
+
   return { title: bible.title, chapters: bible.chapter_plan.length };
 }
 
 /* ------------------------------------------------------------ 3. chapter */
+
+export function validateRecallQuestions(
+  recall: Recall,
+  chapterProse: string,
+  taughtConceptNames: string[],
+  futureConceptNames: string[],
+): { valid: boolean; reason?: string } {
+  const lowerProse = chapterProse.toLowerCase();
+  const taughtSet = new Set(taughtConceptNames.map(norm));
+  const futureSet = new Set(futureConceptNames.map(norm));
+
+  for (const q of recall.questions) {
+    // (a) Must test a concept actually taught in this chapter
+    if (!taughtSet.has(norm(q.concept_name))) {
+      return { valid: false, reason: `Question tests concept "${q.concept_name}" which is not in this chapter.` };
+    }
+
+    // (b) & (c) Evidence check: Must have evidence
+    if (!q.evidence || q.evidence.trim().length < 5) {
+      return { valid: false, reason: `Question for "${q.concept_name}" has no evidence from the chapter.` };
+    }
+
+    // (d) Must not reveal future concept names
+    for (const fc of futureSet) {
+      if (fc.length > 2) {
+        if (q.prompt.toLowerCase().includes(fc) || q.options.some((o) => o.toLowerCase().includes(fc))) {
+          return { valid: false, reason: `Question reveals future concept "${fc}".` };
+        }
+      }
+    }
+  }
+
+  return { valid: true };
+}
 
 export async function stageChapter(
   admin: Admin,
@@ -173,19 +305,42 @@ export async function stageChapter(
   chapterNumber: number,
   now = new Date(),
 ) {
-  const [{ data: bibleRow }, { data: concepts }, { data: edges }, { data: learner }, { data: threads }, { data: cards }, { data: chapters }] =
-    await Promise.all([
-      admin.from("story_bibles").select("bible,rolling_summary").eq("project_id", projectId).eq("user_id", userId).single(),
-      admin.from("concepts").select("id,name,explanation,misconceptions,world_rule,position").eq("project_id", projectId).order("position"),
-      admin.from("concept_edges").select("from_concept,to_concept").eq("project_id", projectId),
-      admin.from("learner_concepts").select("*").eq("project_id", projectId).eq("user_id", userId),
-      admin.from("story_threads").select("*").eq("project_id", projectId).eq("status", "open"),
-      admin.from("craft_cards").select("slug,name,how_to,avoid"),
-      admin.from("chapters").select("id,number").eq("project_id", projectId).eq("user_id", userId),
-    ]);
+  const [
+    { data: project },
+    { data: bibleRow },
+    { data: concepts },
+    { data: edges },
+    { data: learner },
+    { data: threads },
+    { data: cards },
+    { data: chapters },
+  ] = await Promise.all([
+    admin.from("projects").select("settings").eq("id", projectId).single(),
+    admin.from("story_bibles").select("bible,rolling_summary").eq("project_id", projectId).eq("user_id", userId).single(),
+    admin.from("concepts").select("id,name,explanation,misconceptions,world_rule,position").eq("project_id", projectId).order("position"),
+    admin.from("concept_edges").select("from_concept,to_concept").eq("project_id", projectId),
+    admin.from("learner_concepts").select("*").eq("project_id", projectId).eq("user_id", userId),
+    admin.from("story_threads").select("*").eq("project_id", projectId).eq("status", "open"),
+    admin.from("craft_cards").select("slug,name,how_to,avoid"),
+    admin.from("chapters").select("id,number").eq("project_id", projectId).eq("user_id", userId),
+  ]);
+
   if (!bibleRow || !concepts || !chapters) fail("Story is not ready: create the story bible first");
   const chapterRow = chapters.find((c) => c.number === chapterNumber);
   if (!chapterRow) fail("Chapter not found");
+
+  const settings: StorySettings = parseStorySettings(project?.settings);
+
+  // Time budget calculation for target words
+  const budget: TimeBudget = calculateTimeBudget({
+    sourceKind: "topic",
+    concepts: concepts.map((c) => ({ name: c.name, complexity: 2 })),
+    depth: settings.depth,
+    learnerLevel: settings.learnerLevel,
+    reductionFactor: settings.reductionFactor,
+  });
+
+  const targetWords = budget.wordsPerChapter || 800;
 
   const memory: Record<string, MemoryState> = {};
   for (const l of learner ?? []) {
@@ -206,7 +361,11 @@ export async function stageChapter(
     edges: (edges ?? []).map((e) => ({ from: e.from_concept, to: e.to_concept })),
     memory,
     openThreads: (threads ?? []).map((t) => ({
-      id: t.id, label: t.label, conceptId: t.concept_id, plantedIn: t.planted_in, dueBy: t.due_by,
+      id: t.id,
+      label: t.label,
+      conceptId: t.concept_id,
+      plantedIn: t.planted_in,
+      dueBy: t.due_by,
     })),
     now,
   });
@@ -214,12 +373,15 @@ export async function stageChapter(
   const conceptDetails = Object.fromEntries(
     concepts.map((c) => [c.name, { explanation: c.explanation ?? "", world_rule: c.world_rule, misconceptions: c.misconceptions ?? [] }]),
   );
+
   const basePrompt = {
     bible: bibleRow.bible as Bible,
     rollingSummary: bibleRow.rolling_summary as string,
     brief,
     craftCards: cards ?? [],
     conceptDetails,
+    targetWords,
+    settings,
   };
   const required = brief.newConcepts.map((c) => c.name);
 
@@ -231,30 +393,101 @@ export async function stageChapter(
       maxOutputTokens: 8000,
       temperature: 0.85,
     });
-  const verify = (ch: Chapter) =>
-    provider.generateJson({
+
+  const verify = (ch: Chapter) => {
+    const fullText = ch.scenes.map((s) => s.text).join("\n\n");
+    const stockPhrases = findStockPhrases(fullText);
+
+    return provider.generateJson({
       system: VERIFY_SYSTEM,
       prompt: `CONCEPT DEFINITIONS\n${[...brief.newConcepts, ...brief.reviewConcepts]
         .map((c) => `- ${c.name}: ${conceptDetails[c.name]?.explanation}`)
-        .join("\n")}\n\nNEW CONCEPTS THAT MUST BE ACTED ON: ${required.join(", ") || "none"}\n\nCHAPTER\n${JSON.stringify(ch)}\n\n${VERIFY_SHAPE}`,
-      parse: (raw) => VerifySchema.parse(raw),
+        .join("\n")}\n\nNEW CONCEPTS THAT MUST BE ACTED ON: ${required.join(", ") || "none"}\n\nSTORY SO FAR (FOR CONTINUITY)\n${
+        bibleRow.rolling_summary || "Chapter 1"
+      }\n\nCHAPTER PROSE\n${JSON.stringify(ch)}\n\n${
+        stockPhrases.length > 0 ? `BANNED PHRASES FOUND: ${stockPhrases.join(", ")}\n\n` : ""
+      }${VERIFY_SHAPE}`,
+      parse: (raw) => {
+        const v = VerifySchema.parse(raw);
+        if (stockPhrases.length > 0) {
+          v.problems.push({
+            concept_name: null,
+            issue: `Contains banned stock phrases: ${stockPhrases.join(", ")}`,
+          });
+        }
+        return v;
+      },
       maxOutputTokens: 2000,
       temperature: 0,
     });
+  };
 
   let chapter = await draft();
+
+  // Part C.3: Format sanitization
+  chapter.scenes = chapter.scenes.map((s) => ({
+    ...s,
+    text: sanitizeStoryProse(s.text),
+  }));
+
+  // Part B.9: Trim pass if over 15% above target
+  let wordCount = countWords(chapter);
+  if (wordCount > targetWords * 1.15) {
+    try {
+      const trimmed = await provider.generateJson({
+        system: TRIM_SYSTEM,
+        prompt: `TARGET WORDS: ${targetWords}\nCURRENT WORDS: ${wordCount}\n\nCHAPTER TO TRIM:\n${JSON.stringify(chapter)}\n\n${CHAPTER_SYSTEM}`,
+        parse: (raw) => ChapterSchema.parse(raw),
+        maxOutputTokens: 8000,
+        temperature: 0.3,
+      });
+      chapter = trimmed;
+      chapter.scenes = chapter.scenes.map((s) => ({
+        ...s,
+        text: sanitizeStoryProse(s.text),
+      }));
+    } catch {
+      // Keep chapter if trim pass fails parse
+    }
+  }
+
+  // Verifier check (Accuracy, Concept Acted On, Continuity, Stock phrases)
   let check = await verify(chapter);
-  let verified = check.accurate && check.every_concept_acted_on;
+  let verified = check.accurate && check.every_concept_acted_on && (check.continuity_clean ?? true) && check.problems.length === 0;
+
   if (!verified) {
-    // One revision pass, then ship whatever is best and flag it.
-    const revised = await draft(check.fix_instructions ?? check.problems.map((p) => p.issue).join(" "));
+    // One revision pass with specific fix instructions (Part C.5)
+    const fixNotes = check.fix_instructions || check.problems.map((p) => p.issue).join(" | ");
+    const revised = await draft(fixNotes);
+    revised.scenes = revised.scenes.map((s) => ({
+      ...s,
+      text: sanitizeStoryProse(s.text),
+    }));
+
+    // Check trimmed on revision as well
+    if (countWords(revised) > targetWords * 1.15) {
+      try {
+        const trimmed = await provider.generateJson({
+          system: TRIM_SYSTEM,
+          prompt: `TARGET WORDS: ${targetWords}\n\nCHAPTER TO TRIM:\n${JSON.stringify(revised)}`,
+          parse: (raw) => ChapterSchema.parse(raw),
+          maxOutputTokens: 8000,
+          temperature: 0.3,
+        });
+        revised.scenes = trimmed.scenes.map((s) => ({
+          ...s,
+          text: sanitizeStoryProse(s.text),
+        }));
+      } catch {}
+    }
+
     const recheck = await verify(revised);
     chapter = revised;
     check = recheck;
-    verified = recheck.accurate && recheck.every_concept_acted_on;
+    verified = recheck.accurate && recheck.every_concept_acted_on && (recheck.continuity_clean ?? true) && recheck.problems.length === 0;
   }
 
-  // Persist the chapter, story memory and learner state.
+  // Persist the chapter, story memory and learner state
   await admin
     .from("chapters")
     .update({
@@ -306,16 +539,45 @@ export async function stageChapter(
     );
   }
 
-  const recallConcepts = [...brief.newConcepts, ...brief.reviewConcepts].slice(0, 6);
-  const recall = await provider.generateJson({
+  // Part D: Recall questions generated from finished chapter text
+  const chapterFullText = chapter.scenes.map((s) => s.text).join("\n\n");
+  const taughtConcepts = [...brief.newConcepts, ...brief.reviewConcepts];
+  const taughtNames = taughtConcepts.map((c) => c.name);
+
+  // Future concepts that should NOT be revealed
+  const metConceptIds = new Set([...Object.keys(memory), ...brief.newConcepts.map((c) => c.id)]);
+  const futureConcepts = concepts.filter((c) => !metConceptIds.has(c.id)).map((c) => c.name);
+
+  const recallPrompt = (notes?: string) => `FINISHED CHAPTER TEXT\n${chapterFullText}\n\nCONCEPTS IN THIS CHAPTER\n${taughtConcepts
+    .map(
+      (c) =>
+        `- ${c.name}: ${conceptDetails[c.name]?.explanation} (common misconceptions: ${(conceptDetails[c.name]?.misconceptions ?? []).join("; ") || "none"})`,
+    )
+    .join("\n")}\n\nFUTURE CONCEPTS (DO NOT REVEAL OR MENTION THESE)\n${
+    futureConcepts.join(", ") || "none"
+  }\n\n${notes ? `REVISION NOTES:\n${notes}\n\n` : ""}${RECALL_SHAPE}`;
+
+  let recall = await provider.generateJson({
     system: RECALL_SYSTEM,
-    prompt: `STORY SO FAR\n${chapter.summary}\n\nCONCEPTS\n${recallConcepts
-      .map((c) => `- ${c.name}: ${conceptDetails[c.name]?.explanation} (common wrong ideas: ${(conceptDetails[c.name]?.misconceptions ?? []).join("; ") || "none"})`)
-      .join("\n")}\n\n${RECALL_SHAPE}`,
+    prompt: recallPrompt(),
     parse: (raw) => RecallSchema.parse(raw),
     maxOutputTokens: 4000,
-    temperature: 0.4,
+    temperature: 0.3,
   });
+
+  // Validate questions have evidence and only test taught concepts (Part D.3)
+  const validation = validateRecallQuestions(recall, chapterFullText, taughtNames, futureConcepts);
+  if (!validation.valid) {
+    // Regenerate once with feedback
+    recall = await provider.generateJson({
+      system: RECALL_SYSTEM,
+      prompt: recallPrompt(`PREVIOUS QUESTIONS REJECTED: ${validation.reason}. Every question MUST include valid evidence directly from the chapter text and test only concepts in this chapter.`),
+      parse: (raw) => RecallSchema.parse(raw),
+      maxOutputTokens: 4000,
+      temperature: 0.2,
+    });
+  }
+
   await admin.from("quizzes").upsert(
     { user_id: userId, chapter_id: chapterRow.id, questions: recall.questions },
     { onConflict: "chapter_id" },
@@ -330,7 +592,7 @@ export interface RecallResult {
   score: number;
   total: number;
   concepts: { name: string; correct: boolean; level: number; nextReviewAt: string | null }[];
-  review: { correct: boolean; correctIndex: number; explanation: string }[];
+  review: { correct: boolean; correctIndex: number; explanation: string; evidence?: string }[];
 }
 
 /** Grades answers on the server so the correct index is never trusted from the client. */
@@ -350,7 +612,12 @@ export async function recordRecall(
   const { data: chapter } = await admin.from("chapters").select("project_id").eq("id", chapterId).eq("user_id", userId).single();
   if (!quiz || !chapter) fail("Quiz not found");
 
-  const questions = quiz.questions as { correct_index: number; explanation?: string; concept_name?: string }[];
+  const questions = quiz.questions as {
+    correct_index: number;
+    explanation?: string;
+    concept_name?: string;
+    evidence?: string;
+  }[];
   const { data: concepts } = await admin.from("concepts").select("id,name").eq("project_id", chapter.project_id);
   const idByName = new Map((concepts ?? []).map((c) => [norm(c.name), c.id as string]));
 
@@ -367,7 +634,12 @@ export async function recordRecall(
   });
 
   await admin.from("quiz_attempts").insert({
-    user_id: userId, quiz_id: quiz.id, chapter_id: chapterId, answers, score, total: questions.length,
+    user_id: userId,
+    quiz_id: quiz.id,
+    chapter_id: chapterId,
+    answers,
+    score,
+    total: questions.length,
   });
 
   const ids = [...perConcept.keys()];
@@ -379,7 +651,10 @@ export async function recordRecall(
     const row = rows?.find((x) => x.concept_id === id);
     const state: MemoryState = row
       ? {
-          stabilityDays: Number(row.stability_days) || 0, ease: Number(row.ease) || 2.3, lapses: row.lapses ?? 0, reps: row.reps ?? 0,
+          stabilityDays: Number(row.stability_days) || 0,
+          ease: Number(row.ease) || 2.3,
+          lapses: row.lapses ?? 0,
+          reps: row.reps ?? 0,
           lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
           nextReviewAt: row.next_review_at ? new Date(row.next_review_at) : null,
         }
@@ -387,15 +662,26 @@ export async function recordRecall(
     const next = applyReview(state, r.correct, now);
     const level = levelFor(next.stabilityDays);
     await admin.from("learner_concepts").upsert({
-      user_id: userId, concept_id: id, project_id: chapter.project_id,
-      level, stability_days: next.stabilityDays, ease: next.ease, lapses: next.lapses, reps: next.reps,
-      last_seen_at: now.toISOString(), next_review_at: next.nextReviewAt?.toISOString() ?? null,
+      user_id: userId,
+      concept_id: id,
+      project_id: chapter.project_id,
+      level,
+      stability_days: next.stabilityDays,
+      ease: next.ease,
+      lapses: next.lapses,
+      reps: next.reps,
+      last_seen_at: now.toISOString(),
+      next_review_at: next.nextReviewAt?.toISOString() ?? null,
       introduced_in: row?.introduced_in ?? null,
       updated_at: now.toISOString(),
     });
     await admin.from("review_events").insert({
-      user_id: userId, project_id: chapter.project_id, concept_id: id, chapter_id: chapterId,
-      correct: r.correct, kind: "chapter_end",
+      user_id: userId,
+      project_id: chapter.project_id,
+      concept_id: id,
+      chapter_id: chapterId,
+      correct: r.correct,
+      kind: "chapter_end",
     });
     out.push({ name: r.name, correct: r.correct, level, nextReviewAt: next.nextReviewAt?.toISOString() ?? null });
   }
@@ -403,6 +689,7 @@ export async function recordRecall(
     correct: answers[i] === q.correct_index,
     correctIndex: q.correct_index,
     explanation: q.explanation ?? "",
+    evidence: q.evidence ?? "",
   }));
   return { score, total: questions.length, concepts: out, review };
 }

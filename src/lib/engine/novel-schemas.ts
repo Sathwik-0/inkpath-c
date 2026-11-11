@@ -23,6 +23,10 @@ export const ConceptGraphSchema = z.object({
           .string()
           .default("idea")
           .transform((s) => (["idea", "fact", "procedure", "relationship"].includes(s) ? s : "idea")),
+        complexity: z
+          .coerce.number().int().min(1).max(3).default(2)
+          .transform((v) => (v === 1 || v === 3 ? v : 2)),
+        importance: z.coerce.number().int().min(1).max(100).default(50),
         misconceptions: list.transform((a) => a.slice(0, 3).map((s) => s.trim().slice(0, 200))),
         prerequisites: list, // names of other concepts in this list
         source_ref: optText(120),
@@ -94,6 +98,7 @@ export type Chapter = z.infer<typeof ChapterSchema>;
 export const VerifySchema = z.object({
   accurate: z.boolean(),
   every_concept_acted_on: z.boolean(),
+  continuity_clean: z.boolean().default(true),
   problems: z.array(z.object({ concept_name: optText(120), issue: text(400) })).default([]),
   fix_instructions: optText(800),
 });
@@ -108,9 +113,10 @@ export const RecallSchema = z.object({
         correct_index: num.min(0),
         explanation: text(500),
         concept_name: text(120),
+        evidence: text(400).default(""),
       }),
     )
-    .min(2)
+    .min(1)
     .max(8)
     .refine((qs) => qs.every((q) => q.correct_index < q.options.length), {
       message: "correct_index out of range",

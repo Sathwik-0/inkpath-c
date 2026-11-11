@@ -2,6 +2,7 @@ import { z } from "zod";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { currentUser, fail, json } from "@/lib/api";
 import { MAX_UPLOAD_BYTES, chunkText, extractText, kindFromName } from "@/lib/engine/ingest";
+import { parseStorySettings } from "@/lib/engine/settings";
 
 export const maxDuration = 60;
 
@@ -11,6 +12,7 @@ const Body = z.object({
   topic: z.string().trim().max(300).optional(),
   text: z.string().trim().max(200_000).optional(),
   youtube: z.string().trim().url().max(300).optional(),
+  settings: z.unknown().optional(),
 });
 
 export async function GET() {
@@ -36,11 +38,21 @@ export async function POST(req: Request) {
   const type = req.headers.get("content-type") ?? "";
   if (type.includes("multipart/form-data")) {
     const form = await req.formData();
+    let rawSettings: unknown = undefined;
+    const settingsStr = form.get("settings");
+    if (typeof settingsStr === "string") {
+      try {
+        rawSettings = JSON.parse(settingsStr);
+      } catch {
+        rawSettings = undefined;
+      }
+    }
     fields = Body.parse({
       title: (form.get("title") as string) || undefined,
       topic: (form.get("topic") as string) || undefined,
       text: (form.get("text") as string) || undefined,
       youtube: (form.get("youtube") as string) || undefined,
+      settings: rawSettings,
     });
     const f = form.get("file");
     if (f instanceof File && f.size > 0) file = f;
@@ -49,6 +61,8 @@ export async function POST(req: Request) {
     if (!parsed.success) return fail("Check the topic, text or link you entered.", 400);
     fields = parsed.data;
   }
+
+  const validatedSettings = parseStorySettings(fields.settings);
 
   let extracted = "";
   let kind: "pdf" | "docx" | "txt" | "text" | "youtube" | "topic";
@@ -79,7 +93,13 @@ export async function POST(req: Request) {
 
   const { data: project, error } = await admin
     .from("projects")
-    .insert({ user_id: auth.user.id, title: sourceTitle, subject: fields.topic ?? sourceTitle })
+    .insert({
+      user_id: auth.user.id,
+      title: sourceTitle,
+      subject: fields.topic ?? sourceTitle,
+      genre: validatedSettings.genre !== "auto" ? validatedSettings.genre : undefined,
+      settings: validatedSettings,
+    })
     .select("id").single();
   if (error || !project) return fail("Could not create the project.", 500);
 
