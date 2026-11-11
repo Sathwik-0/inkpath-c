@@ -56,6 +56,9 @@ export function AuthForm({ mode }: { mode: "login" | "signup" }) {
       <p className="mt-6 text-body-md text-on-surface-variant">
         {mode === "login" ? <>New here? <Link className="text-primary" href="/signup">Create an account</Link></> : <>Already have an account? <Link className="text-primary" href="/login">Sign in</Link></>}
       </p>
+      <p className="mt-4 text-xs text-outline leading-relaxed text-center">
+        For free chapters paid by the platform, learning content may be processed by Google and Groq.
+      </p>
     </div>
   );
 }

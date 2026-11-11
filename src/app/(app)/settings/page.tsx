@@ -17,6 +17,9 @@ export default async function Settings() {
       <p className="mt-2 text-body-lg text-on-surface-variant">
         You get {f.total} free chapters ({f.remaining} left). After that, connect your own key and keep reading at your provider's price. Keys are encrypted and never shown again.
       </p>
+      <p className="mt-1 text-body-sm text-outline">
+        For free chapters paid by the platform, learning content may be processed by Google and Groq. When you connect your own key, requests go directly to your configured provider.
+      </p>
       <Keys connections={(connections ?? []) as { provider: string; key_mask: string; status: string }[]} />
     </div>
   );

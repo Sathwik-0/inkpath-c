@@ -76,11 +76,10 @@ export default function Create() {
                 key={t.id}
                 disabled={busy}
                 onClick={() => setMode(t.id)}
-                className={`rounded-xl px-4 py-2 font-label-md text-label-md ${
-                  mode === t.id
+                className={`rounded-xl px-4 py-2 font-label-md text-label-md ${mode === t.id
                     ? "bg-primary-container text-on-primary-container"
                     : "border border-outline-variant text-on-surface-variant"
-                }`}
+                  }`}
               >
                 {t.label}
               </button>

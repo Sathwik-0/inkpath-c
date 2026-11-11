@@ -30,6 +30,41 @@ export interface ResolvedProvider {
 const TEXT_FALLBACK_ORDER: ProviderName[] = ["gemini", "anthropic", "openai", "groq"];
 
 /**
+ * Returns the list of active, configured platform providers for text generation,
+ * honoring PLATFORM_TEXT_PROVIDERS, per-provider disable flags, and story preference.
+ */
+export function getPlatformTextCandidates(preferred?: ProviderName | null): { name: ProviderName; provider: AIProvider }[] {
+  if (serverEnv.platformGenerationPaused) throw new PlatformPausedError();
+
+  const configuredOrder = serverEnv.platformTextProviders;
+  const orderedNames: ProviderName[] = [];
+
+  // Prefer original story provider if specified and configured
+  if (preferred && configuredOrder.includes(preferred)) {
+    orderedNames.push(preferred);
+    for (const p of configuredOrder) {
+      if (p !== preferred) orderedNames.push(p);
+    }
+  } else {
+    orderedNames.push(...configuredOrder);
+  }
+
+  const result: { name: ProviderName; provider: AIProvider }[] = [];
+  for (const name of orderedNames) {
+    if (serverEnv.isPlatformProviderDisabled(name)) continue;
+    const key = serverEnv.getPlatformKey(name);
+    if (!key) continue;
+    result.push({ name, provider: createProvider(name, key) });
+  }
+
+  if (result.length === 0) {
+    throw new NoProviderError("Free generation is not configured on this server yet or all platform providers are disabled.");
+  }
+
+  return result;
+}
+
+/**
  * Picks the key that pays for a job. The funding source is decided once when
  * the job is created and never changes: if a user's own key fails we stop and
  * ask, we do NOT quietly switch to the platform key (or the reverse).
@@ -39,12 +74,18 @@ export async function resolveProvider(
   userId: string,
   funding: Funding,
   task: Task,
+  preferred?: ProviderName | null,
 ): Promise<ResolvedProvider> {
   if (funding === "platform") {
     if (serverEnv.platformGenerationPaused) throw new PlatformPausedError();
-    const key = serverEnv.geminiPlatformKey;
-    if (!key) throw new NoProviderError("Free generation is not configured on this server yet.");
-    return { provider: createProvider("gemini", key), name: "gemini", funding };
+    if (task === "images") {
+      const key = serverEnv.geminiPlatformKey;
+      if (!key) throw new NoProviderError("Free generation is not configured on this server yet.");
+      return { provider: createProvider("gemini", key), name: "gemini", funding };
+    }
+    const candidates = getPlatformTextCandidates(preferred);
+    const primary = candidates[0];
+    return { provider: primary.provider, name: primary.name, funding };
   }
 
   const [{ data: rows }, { data: profile }] = await Promise.all([

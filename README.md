@@ -33,7 +33,19 @@ Import the repo, then add these environment variables (see `.env.example`):
 | `KEY_ENCRYPTION_SECRET` | run `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` once; never change it afterwards or saved user keys become unreadable |
 | `JOB_RUNNER_SECRET` | any long random string |
 | `APP_URL` | your Vercel URL |
-| `GEMINI_PLATFORM_KEY` | optional; pays for the 3 free chapters. Set a spending cap on it. Without it, users must bring their own key. |
+| `GEMINI_PLATFORM_KEY` | optional; primary key for free chapters. |
+| `GROQ_PLATFORM_KEY` | optional; secondary key for free chapters failover. |
+| `GROQ_TEXT_MODEL` | optional; model for Groq text generation (default `openai/gpt-oss-120b`). |
+| `PLATFORM_TEXT_PROVIDERS` | comma-separated order of fallback for free chapters (default `gemini,groq`). |
+| `PLATFORM_DISABLE_<PROVIDER>` | e.g. `PLATFORM_DISABLE_GROQ=true` or `PLATFORM_DISABLE_GEMINI=true` to instantly disable a provider. |
+| `PLATFORM_GENERATION_PAUSED` | set to `true` to pause all platform-funded generation. |
+
+### Platform Fallback Chain
+Free chapters funded by the platform use a resilient fallback chain configured by `PLATFORM_TEXT_PROVIDERS` (default `gemini,groq`).
+- If the primary provider encounters transient errors (rate limit, quota exceeded, 5xx server error, timeout, or schema failures), the engine seamlessly retries the step on the secondary provider.
+- Failover applies **strictly to platform-funded jobs**; users who bring their own key (BYOK) are never routed to platform providers.
+- An invalid API key will never trigger failover (it alerts immediately).
+- Each provider can be independently toggled off at any time using `PLATFORM_DISABLE_<NAME>=true` (e.g. `PLATFORM_DISABLE_GROQ=true`), or globally paused with `PLATFORM_GENERATION_PAUSED=true`.
 
 Deploy. Generation routes use `maxDuration = 300` seconds; this needs Vercel's default Fluid compute (on by default for new projects). If your plan caps functions lower, chapters may time out.
 

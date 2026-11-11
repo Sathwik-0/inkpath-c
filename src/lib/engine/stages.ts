@@ -567,7 +567,7 @@ export async function stageChapter(
       summary: chapter.summary,
       prose: { scenes: chapter.scenes },
       hook: brief.isFinal ? null : chapter.hook,
-      brief,
+      brief: { ...brief, provider: provider.name },
       verified,
       verify_notes: verified ? null : check.problems.map((p) => p.issue).join(" | ").slice(0, 1000),
       status: "ready",

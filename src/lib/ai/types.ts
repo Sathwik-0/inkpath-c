@@ -1,5 +1,7 @@
 export type ProviderName = "gemini" | "openai" | "anthropic" | "groq";
 
+export { ProviderError, type ProviderErrorCode } from "./errors";
+
 export const PROVIDERS: ProviderName[] = ["gemini", "openai", "anthropic", "groq"];
 
 export const PROVIDER_LABEL: Record<ProviderName, string> = {

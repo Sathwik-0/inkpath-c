@@ -1,8 +1,9 @@
 import "server-only";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { resolveProvider, type Funding } from "./credentials";
+import { resolveProvider, getPlatformTextCandidates, type Funding } from "./credentials";
 import { stageAnalyze, stageBible, stageChapter } from "./stages";
 import { publicError } from "@/lib/api";
+import { ProviderError, type ProviderName } from "@/lib/ai";
 
 export type JobType = "analyze" | "bible" | "chapter";
 
@@ -18,6 +19,49 @@ export class JobRejected extends Error {
   constructor(public reason: string, message: string) {
     super(message);
   }
+}
+
+/**
+ * Checks whether an error is eligible for platform provider failover.
+ * Only fail over on: rate limited, quota exceeded, server error (5xx), network error,
+ * timeout, and bad_response (schema failure after retries).
+ * Never fail over on invalid key (alert instead) or content blocked.
+ */
+export function isFailoverEligible(err: unknown): boolean {
+  if (err instanceof ProviderError) {
+    if (
+      err.code === "rate_limited" ||
+      err.code === "quota_exceeded" ||
+      err.code === "network" ||
+      err.code === "bad_response"
+    ) {
+      return true;
+    }
+    return false;
+  }
+  if (err instanceof Error) {
+    if (/timed?\s*out|timeout|network|econnrefused|econnreset|fetch failed|socket|5\d\d/i.test(err.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Looks up the provider that generated Chapter 1 (or the earliest chapter)
+ * so subsequent chapters can prefer the same provider for story continuity.
+ */
+async function getOriginalStoryProvider(admin: any, projectId: string): Promise<ProviderName | null> {
+  const { data: ch } = await admin
+    .from("chapters")
+    .select("brief")
+    .eq("project_id", projectId)
+    .eq("number", 1)
+    .maybeSingle();
+  if (ch?.brief && typeof ch.brief === "object" && (ch.brief as any).provider) {
+    return (ch.brief as any).provider as ProviderName;
+  }
+  return null;
 }
 
 /**
@@ -82,14 +126,124 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
 
   const run = async () => {
     const set = (v: Record<string, unknown>) => admin.from("generation_jobs").update(v).eq("id", job.id);
+    const telemetryEntries: any[] = [];
+
     try {
       await set({ status: "running", step: a.type, progress: 10 });
-      const { provider, name } = await resolveProvider(admin, a.userId, a.funding, a.type === "chapter" ? "story" : "analysis");
-      await set({ provider: name });
-      if (a.type === "analyze") await stageAnalyze(admin, provider, a.userId, a.projectId);
-      else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
-      else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
-      await set({ status: "succeeded", progress: 100, step: "done" });
+
+      if (a.funding === "byok") {
+        // BYOK: single provider resolved from user's keys. NEVER falls back to platform.
+        const { provider, name } = await resolveProvider(
+          admin,
+          a.userId,
+          "byok",
+          a.type === "chapter" ? "story" : "analysis",
+        );
+        await set({ provider: name });
+
+        const start = Date.now();
+        if (a.type === "analyze") await stageAnalyze(admin, provider, a.userId, a.projectId);
+        else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
+        else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
+
+        const durationMs = Date.now() - start;
+        telemetryEntries.push({
+          step: a.type,
+          provider: name,
+          durationMs,
+          failoverCount: 0,
+        });
+
+        await set({
+          status: "succeeded",
+          progress: 100,
+          step: "done",
+          payload: { chapterNumber: a.chapterNumber ?? null, telemetry: telemetryEntries },
+        });
+      } else {
+        // PLATFORM: fallback chain
+        const originalProvider = await getOriginalStoryProvider(admin, a.projectId);
+        const candidates = getPlatformTextCandidates(originalProvider);
+
+        let lastErr: unknown = null;
+        let successfulProvider: ProviderName | null = null;
+        const failovers: { from: ProviderName; to: ProviderName; reason: string }[] = [];
+
+        for (let i = 0; i < candidates.length; i++) {
+          const candidate = candidates[i];
+          const name = candidate.name;
+          const provider = candidate.provider;
+
+          if (i > 0) {
+            console.warn(
+              `[platform fallback] Step "${a.type}" failed on previous provider. Retrying on fallback provider: ${name} (error: ${
+                lastErr instanceof ProviderError ? lastErr.code : lastErr instanceof Error ? lastErr.message : "error"
+              })`,
+            );
+          } else {
+            console.log(`[platform execution] Step "${a.type}" running on provider: ${name}`);
+          }
+
+          await set({ provider: name });
+          const start = Date.now();
+
+          try {
+            if (a.type === "analyze") await stageAnalyze(admin, provider, a.userId, a.projectId);
+            else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
+            else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
+
+            const durationMs = Date.now() - start;
+            successfulProvider = name;
+
+            telemetryEntries.push({
+              step: a.type,
+              provider: name,
+              durationMs,
+              failoverCount: i,
+              failovers,
+            });
+
+            break; // Succeeded!
+          } catch (stepErr: any) {
+            lastErr = stepErr;
+
+            if (stepErr instanceof ProviderError && stepErr.code === "invalid_key") {
+              console.error(`[ALERT] Platform key for provider "${name}" rejected as invalid! Do not failover on bad credentials.`);
+              throw stepErr;
+            }
+            if (stepErr instanceof ProviderError && stepErr.code === "content_blocked") {
+              // Do not fail over on content blocked
+              throw stepErr;
+            }
+
+            const canFailover = isFailoverEligible(stepErr) && i < candidates.length - 1;
+            if (canFailover) {
+              const nextName = candidates[i + 1].name;
+              failovers.push({
+                from: name,
+                to: nextName,
+                reason: stepErr instanceof ProviderError ? stepErr.code : stepErr instanceof Error ? stepErr.message : "error",
+              });
+              continue;
+            }
+
+            // Not eligible or all candidates exhausted
+            throw stepErr;
+          }
+        }
+
+        if (!successfulProvider) {
+          throw lastErr || new Error("All platform providers failed.");
+        }
+
+        await set({
+          status: "succeeded",
+          progress: 100,
+          step: "done",
+          provider: successfulProvider,
+          payload: { chapterNumber: a.chapterNumber ?? null, telemetry: telemetryEntries },
+        });
+      }
     } catch (e: any) {
       const { code, message } = publicError(e);
       console.error("job failed", job.id, a.type, code, e?.message || e);

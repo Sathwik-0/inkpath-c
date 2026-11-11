@@ -35,7 +35,29 @@ export class GroqProvider implements AIProvider {
       classify: classifyGroq,
       timeoutMs: 20_000,
     });
-    return { ok: true, models: (data.data ?? []).map((m) => m.id) };
+    const models = (data.data ?? []).map((m) => m.id);
+    const configuredModel = MODELS.groq.text;
+    if (!models.includes(configuredModel)) {
+      console.warn(
+        `[Groq Warning] Configured model "${configuredModel}" was not found in available models: ${models.join(", ")}`,
+      );
+    }
+    return { ok: true, models };
+  }
+
+  /**
+   * Startup or admin check that verifies if the configured GROQ_TEXT_MODEL is active on Groq.
+   */
+  async verifyConfiguredModel(): Promise<{ available: boolean; configured: string; availableModels: string[] }> {
+    try {
+      const res = await this.validateKey();
+      const configured = MODELS.groq.text;
+      const available = res.models.includes(configured);
+      return { available, configured, availableModels: res.models };
+    } catch (err: any) {
+      console.warn(`[Groq Warning] Failed to verify model availability:`, err?.message || err);
+      return { available: false, configured: MODELS.groq.text, availableModels: [] };
+    }
   }
 
   private async chat(system: string, prompt: string, json: boolean, maxTokens: number, temperature = 0.7) {
@@ -83,3 +105,4 @@ export class GroqProvider implements AIProvider {
     );
   }
 }
+
