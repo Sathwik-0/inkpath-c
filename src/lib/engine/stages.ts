@@ -1,0 +1,408 @@
+import "server-only";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { AIProvider } from "@/lib/ai";
+import { NEW_STATE, applyReview, levelFor, type MemoryState } from "@/lib/learning/scheduler";
+import { planChapter, type ChapterBrief } from "@/lib/learning/planner";
+import { sourceBlock } from "./prompts";
+import {
+  BibleSchema,
+  ChapterSchema,
+  ConceptGraphSchema,
+  RecallSchema,
+  VerifySchema,
+  type Bible,
+  type Chapter,
+} from "./novel-schemas";
+import {
+  BIBLE_SYSTEM,
+  CHAPTER_SYSTEM,
+  CONCEPT_GRAPH_SHAPE,
+  CONCEPT_GRAPH_SYSTEM,
+  RECALL_SHAPE,
+  RECALL_SYSTEM,
+  VERIFY_SHAPE,
+  VERIFY_SYSTEM,
+  bibleShape,
+  buildChapterPrompt,
+} from "./novel-prompts";
+
+type Admin = SupabaseClient;
+const norm = (s: string) => s.trim().toLowerCase();
+const MAX_SOURCE_CHARS = 60_000;
+
+function fail(message: string): never {
+  throw new Error(message);
+}
+
+/* ------------------------------------------------------------ 1. analyze */
+
+export async function stageAnalyze(admin: Admin, provider: AIProvider, userId: string, projectId: string) {
+  const { data: project } = await admin.from("projects").select("*").eq("id", projectId).eq("user_id", userId).single();
+  if (!project) fail("Project not found");
+
+  const { data: chunks } = await admin
+    .from("extracted_content")
+    .select("content,location")
+    .eq("project_id", projectId)
+    .order("chunk_index");
+  let source = (chunks ?? []).map((c) => c.content).join("\n\n").slice(0, MAX_SOURCE_CHARS);
+  const isTopicOnly = !source;
+  if (isTopicOnly) source = `Topic: ${project.subject ?? project.title}`;
+
+  const { data: yt } = await admin
+    .from("source_documents").select("url").eq("project_id", projectId).eq("kind", "youtube").not("url", "is", null).limit(1);
+  const youtubeUrl = yt?.[0]?.url as string | undefined;
+  if (youtubeUrl && isTopicOnly && provider.name !== "gemini")
+    fail("YouTube links need a Google Gemini key. Paste the transcript as text, or connect Gemini.");
+  if (youtubeUrl && isTopicOnly) source = "Learn from the attached YouTube video.";
+
+  const graph = await provider.generateJson({
+    system: CONCEPT_GRAPH_SYSTEM,
+    attachments: youtubeUrl && isTopicOnly ? [{ kind: "youtube", url: youtubeUrl }] : undefined,
+    prompt: `${isTopicOnly && !youtubeUrl ? source : sourceBlock(source)}\n\n${CONCEPT_GRAPH_SHAPE}`,
+    parse: (raw) => ConceptGraphSchema.parse(raw),
+    maxOutputTokens: 8000,
+    temperature: 0.3,
+  });
+
+  // Re-running replaces the previous graph.
+  await admin.from("concepts").delete().eq("project_id", projectId);
+  const { data: inserted, error } = await admin
+    .from("concepts")
+    .insert(
+      graph.concepts.map((c, i) => ({
+        user_id: userId,
+        project_id: projectId,
+        name: c.name,
+        explanation: c.explanation,
+        objective: c.objective,
+        kind: c.kind,
+        misconceptions: c.misconceptions,
+        source_ref: c.source_ref,
+        position: i,
+      })),
+    )
+    .select("id,name");
+  if (error || !inserted) fail("Could not save concepts");
+
+  const idByName = new Map(inserted.map((c) => [norm(c.name), c.id as string]));
+  const edges: { user_id: string; project_id: string; from_concept: string; to_concept: string }[] = [];
+  for (const c of graph.concepts) {
+    const to = idByName.get(norm(c.name));
+    for (const p of c.prerequisites) {
+      const from = idByName.get(norm(p));
+      if (from && to && from !== to) edges.push({ user_id: userId, project_id: projectId, from_concept: from, to_concept: to });
+    }
+  }
+  if (edges.length) await admin.from("concept_edges").insert(edges);
+
+  await admin
+    .from("projects")
+    .update({
+      title: project.title || graph.title,
+      genre: graph.recommended_genre,
+      synopsis: graph.summary,
+      estimated_chapters: graph.estimated_chapters,
+      status: "analyzed",
+    })
+    .eq("id", projectId);
+  return { concepts: inserted.length, chapters: graph.estimated_chapters, genre: graph.recommended_genre };
+}
+
+/* -------------------------------------------------------------- 2. bible */
+
+export async function stageBible(admin: Admin, provider: AIProvider, userId: string, projectId: string) {
+  const { data: project } = await admin.from("projects").select("*").eq("id", projectId).eq("user_id", userId).single();
+  if (!project) fail("Project not found");
+  const { data: concepts } = await admin
+    .from("concepts")
+    .select("id,name,explanation,misconceptions")
+    .eq("project_id", projectId)
+    .order("position");
+  if (!concepts?.length) fail("Analyze the material first");
+
+  const genre = project.genre ?? "adventure";
+  const chapters = project.estimated_chapters ?? 3;
+  const bible = await provider.generateJson({
+    system: BIBLE_SYSTEM,
+    prompt: `CONCEPTS TO TEACH (in dependency order)\n${concepts
+      .map((c) => `- ${c.name}: ${c.explanation}`)
+      .join("\n")}\n\n${bibleShape(genre, chapters)}`,
+    parse: (raw) => BibleSchema.parse(raw),
+    maxOutputTokens: 8000,
+    temperature: 0.9,
+  });
+
+  await admin.from("story_bibles").upsert({
+    project_id: projectId,
+    user_id: userId,
+    bible,
+    voice: bible.voice,
+    rolling_summary: "",
+  });
+
+  const idByName = new Map(concepts.map((c) => [norm(c.name), c.id as string]));
+  for (const r of bible.rules) {
+    const id = idByName.get(norm(r.concept_name));
+    if (id) await admin.from("concepts").update({ world_rule: r.rule }).eq("id", id);
+  }
+
+  await admin.from("chapters").delete().eq("project_id", projectId);
+  await admin.from("chapters").insert(
+    bible.chapter_plan.map((c) => ({
+      user_id: userId,
+      project_id: projectId,
+      number: c.number,
+      title: c.title,
+      summary: c.beat,
+      format: "novel",
+      status: "outline",
+    })),
+  );
+  await admin.from("projects").update({ title: bible.title, synopsis: bible.logline, status: "previewed" }).eq("id", projectId);
+  return { title: bible.title, chapters: bible.chapter_plan.length };
+}
+
+/* ------------------------------------------------------------ 3. chapter */
+
+export async function stageChapter(
+  admin: Admin,
+  provider: AIProvider,
+  userId: string,
+  projectId: string,
+  chapterNumber: number,
+  now = new Date(),
+) {
+  const [{ data: bibleRow }, { data: concepts }, { data: edges }, { data: learner }, { data: threads }, { data: cards }, { data: chapters }] =
+    await Promise.all([
+      admin.from("story_bibles").select("bible,rolling_summary").eq("project_id", projectId).eq("user_id", userId).single(),
+      admin.from("concepts").select("id,name,explanation,misconceptions,world_rule,position").eq("project_id", projectId).order("position"),
+      admin.from("concept_edges").select("from_concept,to_concept").eq("project_id", projectId),
+      admin.from("learner_concepts").select("*").eq("project_id", projectId).eq("user_id", userId),
+      admin.from("story_threads").select("*").eq("project_id", projectId).eq("status", "open"),
+      admin.from("craft_cards").select("slug,name,how_to,avoid"),
+      admin.from("chapters").select("id,number").eq("project_id", projectId).eq("user_id", userId),
+    ]);
+  if (!bibleRow || !concepts || !chapters) fail("Story is not ready: create the story bible first");
+  const chapterRow = chapters.find((c) => c.number === chapterNumber);
+  if (!chapterRow) fail("Chapter not found");
+
+  const memory: Record<string, MemoryState> = {};
+  for (const l of learner ?? []) {
+    memory[l.concept_id] = {
+      stabilityDays: Number(l.stability_days) || 0,
+      ease: Number(l.ease) || 2.3,
+      lapses: l.lapses ?? 0,
+      reps: l.reps ?? 0,
+      lastSeenAt: l.last_seen_at ? new Date(l.last_seen_at) : null,
+      nextReviewAt: l.next_review_at ? new Date(l.next_review_at) : null,
+    };
+  }
+
+  const brief: ChapterBrief = planChapter({
+    chapterNumber,
+    totalChapters: chapters.length,
+    concepts: concepts.map((c) => ({ id: c.id, name: c.name, position: c.position, misconceptions: c.misconceptions ?? [] })),
+    edges: (edges ?? []).map((e) => ({ from: e.from_concept, to: e.to_concept })),
+    memory,
+    openThreads: (threads ?? []).map((t) => ({
+      id: t.id, label: t.label, conceptId: t.concept_id, plantedIn: t.planted_in, dueBy: t.due_by,
+    })),
+    now,
+  });
+
+  const conceptDetails = Object.fromEntries(
+    concepts.map((c) => [c.name, { explanation: c.explanation ?? "", world_rule: c.world_rule, misconceptions: c.misconceptions ?? [] }]),
+  );
+  const basePrompt = {
+    bible: bibleRow.bible as Bible,
+    rollingSummary: bibleRow.rolling_summary as string,
+    brief,
+    craftCards: cards ?? [],
+    conceptDetails,
+  };
+  const required = brief.newConcepts.map((c) => c.name);
+
+  const draft = (fix?: string | null) =>
+    provider.generateJson({
+      system: CHAPTER_SYSTEM,
+      prompt: buildChapterPrompt({ ...basePrompt, fixInstructions: fix }),
+      parse: (raw) => ChapterSchema.parse(raw),
+      maxOutputTokens: 8000,
+      temperature: 0.85,
+    });
+  const verify = (ch: Chapter) =>
+    provider.generateJson({
+      system: VERIFY_SYSTEM,
+      prompt: `CONCEPT DEFINITIONS\n${[...brief.newConcepts, ...brief.reviewConcepts]
+        .map((c) => `- ${c.name}: ${conceptDetails[c.name]?.explanation}`)
+        .join("\n")}\n\nNEW CONCEPTS THAT MUST BE ACTED ON: ${required.join(", ") || "none"}\n\nCHAPTER\n${JSON.stringify(ch)}\n\n${VERIFY_SHAPE}`,
+      parse: (raw) => VerifySchema.parse(raw),
+      maxOutputTokens: 2000,
+      temperature: 0,
+    });
+
+  let chapter = await draft();
+  let check = await verify(chapter);
+  let verified = check.accurate && check.every_concept_acted_on;
+  if (!verified) {
+    // One revision pass, then ship whatever is best and flag it.
+    const revised = await draft(check.fix_instructions ?? check.problems.map((p) => p.issue).join(" "));
+    const recheck = await verify(revised);
+    chapter = revised;
+    check = recheck;
+    verified = recheck.accurate && recheck.every_concept_acted_on;
+  }
+
+  // Persist the chapter, story memory and learner state.
+  await admin
+    .from("chapters")
+    .update({
+      title: chapter.title,
+      summary: chapter.summary,
+      prose: { scenes: chapter.scenes },
+      hook: brief.isFinal ? null : chapter.hook,
+      brief,
+      verified,
+      verify_notes: verified ? null : check.problems.map((p) => p.issue).join(" | ").slice(0, 1000),
+      status: "ready",
+    })
+    .eq("id", chapterRow.id);
+
+  const idByName = new Map(concepts.map((c) => [norm(c.name), c.id as string]));
+  if (chapter.new_threads.length) {
+    await admin.from("story_threads").insert(
+      chapter.new_threads.map((t) => ({
+        user_id: userId,
+        project_id: projectId,
+        label: t.label,
+        concept_id: t.concept_name ? idByName.get(norm(t.concept_name)) ?? null : null,
+        planted_in: chapterNumber,
+        due_by: t.due_by ?? Math.min(chapters.length, chapterNumber + 2),
+      })),
+    );
+  }
+  const paid = new Set(chapter.paid_off_threads.map(norm));
+  for (const t of threads ?? []) {
+    if (paid.has(norm(t.label)) || brief.payoffThreads.some((p) => p.id === t.id)) {
+      await admin.from("story_threads").update({ status: "paid_off", paid_off_in: chapterNumber }).eq("id", t.id);
+    }
+  }
+  await admin
+    .from("story_bibles")
+    .update({ rolling_summary: `${bibleRow.rolling_summary}\nCh ${chapterNumber}: ${chapter.summary}`.trim() })
+    .eq("project_id", projectId);
+
+  const fresh = brief.newConcepts.filter((c) => !memory[c.id]);
+  if (fresh.length) {
+    await admin.from("learner_concepts").upsert(
+      fresh.map((c) => ({
+        user_id: userId,
+        project_id: projectId,
+        concept_id: c.id,
+        introduced_in: chapterNumber,
+      })),
+      { ignoreDuplicates: true },
+    );
+  }
+
+  const recallConcepts = [...brief.newConcepts, ...brief.reviewConcepts].slice(0, 6);
+  const recall = await provider.generateJson({
+    system: RECALL_SYSTEM,
+    prompt: `STORY SO FAR\n${chapter.summary}\n\nCONCEPTS\n${recallConcepts
+      .map((c) => `- ${c.name}: ${conceptDetails[c.name]?.explanation} (common wrong ideas: ${(conceptDetails[c.name]?.misconceptions ?? []).join("; ") || "none"})`)
+      .join("\n")}\n\n${RECALL_SHAPE}`,
+    parse: (raw) => RecallSchema.parse(raw),
+    maxOutputTokens: 4000,
+    temperature: 0.4,
+  });
+  await admin.from("quizzes").upsert(
+    { user_id: userId, chapter_id: chapterRow.id, questions: recall.questions },
+    { onConflict: "chapter_id" },
+  );
+
+  return { chapterId: chapterRow.id, verified, newConcepts: required, reviews: brief.reviewConcepts.map((c) => c.name) };
+}
+
+/* ------------------------------------------------------------- 4. recall */
+
+export interface RecallResult {
+  score: number;
+  total: number;
+  concepts: { name: string; correct: boolean; level: number; nextReviewAt: string | null }[];
+  review: { correct: boolean; correctIndex: number; explanation: string }[];
+}
+
+/** Grades answers on the server so the correct index is never trusted from the client. */
+export async function recordRecall(
+  admin: Admin,
+  userId: string,
+  chapterId: string,
+  answers: number[],
+  now = new Date(),
+): Promise<RecallResult> {
+  const { data: quiz } = await admin
+    .from("quizzes")
+    .select("id,questions,chapter_id")
+    .eq("chapter_id", chapterId)
+    .eq("user_id", userId)
+    .single();
+  const { data: chapter } = await admin.from("chapters").select("project_id").eq("id", chapterId).eq("user_id", userId).single();
+  if (!quiz || !chapter) fail("Quiz not found");
+
+  const questions = quiz.questions as { correct_index: number; explanation?: string; concept_name?: string }[];
+  const { data: concepts } = await admin.from("concepts").select("id,name").eq("project_id", chapter.project_id);
+  const idByName = new Map((concepts ?? []).map((c) => [norm(c.name), c.id as string]));
+
+  const perConcept = new Map<string, { name: string; correct: boolean }>();
+  let score = 0;
+  questions.forEach((q, i) => {
+    const ok = answers[i] === q.correct_index;
+    if (ok) score++;
+    const id = q.concept_name ? idByName.get(norm(q.concept_name)) : undefined;
+    if (id) {
+      const prev = perConcept.get(id);
+      perConcept.set(id, { name: q.concept_name!, correct: (prev?.correct ?? true) && ok });
+    }
+  });
+
+  await admin.from("quiz_attempts").insert({
+    user_id: userId, quiz_id: quiz.id, chapter_id: chapterId, answers, score, total: questions.length,
+  });
+
+  const ids = [...perConcept.keys()];
+  const { data: rows } = ids.length
+    ? await admin.from("learner_concepts").select("*").eq("user_id", userId).in("concept_id", ids)
+    : { data: [] as never[] };
+  const out: RecallResult["concepts"] = [];
+  for (const [id, r] of perConcept) {
+    const row = rows?.find((x) => x.concept_id === id);
+    const state: MemoryState = row
+      ? {
+          stabilityDays: Number(row.stability_days) || 0, ease: Number(row.ease) || 2.3, lapses: row.lapses ?? 0, reps: row.reps ?? 0,
+          lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
+          nextReviewAt: row.next_review_at ? new Date(row.next_review_at) : null,
+        }
+      : NEW_STATE;
+    const next = applyReview(state, r.correct, now);
+    const level = levelFor(next.stabilityDays);
+    await admin.from("learner_concepts").upsert({
+      user_id: userId, concept_id: id, project_id: chapter.project_id,
+      level, stability_days: next.stabilityDays, ease: next.ease, lapses: next.lapses, reps: next.reps,
+      last_seen_at: now.toISOString(), next_review_at: next.nextReviewAt?.toISOString() ?? null,
+      introduced_in: row?.introduced_in ?? null,
+      updated_at: now.toISOString(),
+    });
+    await admin.from("review_events").insert({
+      user_id: userId, project_id: chapter.project_id, concept_id: id, chapter_id: chapterId,
+      correct: r.correct, kind: "chapter_end",
+    });
+    out.push({ name: r.name, correct: r.correct, level, nextReviewAt: next.nextReviewAt?.toISOString() ?? null });
+  }
+  const review = questions.map((q, i) => ({
+    correct: answers[i] === q.correct_index,
+    correctIndex: q.correct_index,
+    explanation: q.explanation ?? "",
+  }));
+  return { score, total: questions.length, concepts: out, review };
+}
