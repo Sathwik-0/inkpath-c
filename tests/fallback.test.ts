@@ -274,5 +274,48 @@ describe("Free chapter failover accounting & isolation", () => {
 
     expect(released).toBe(true);
   });
+
+  it("retries exactly once on fallback model when primary Gemini model hits quota or not-found", async () => {
+    const modelsTried: string[] = [];
+    const fakeGenerateWithFallback = async (
+      candidates: string[],
+      callModel: (m: string) => Promise<string>,
+    ) => {
+      let lastErr: any = null;
+      for (let i = 0; i < candidates.length; i++) {
+        const m = candidates[i];
+        modelsTried.push(m);
+        try {
+          return await callModel(m);
+        } catch (err: any) {
+          lastErr = err;
+          const isQuotaOrNotFound =
+            err.code === "quota_exceeded" ||
+            err.code === "rate_limited" ||
+            err.code === "billing_required" ||
+            /404|not found/i.test(err.message);
+          if (isQuotaOrNotFound && i < candidates.length - 1) {
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr;
+    };
+
+    const result = await fakeGenerateWithFallback(
+      ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+      async (model: string) => {
+        if (model === "gemini-2.5-flash") {
+          throw new ProviderError("quota_exceeded", "Daily quota reached for gemini-2.5-flash");
+        }
+        return `Generated successfully on ${model}`;
+      },
+    );
+
+    expect(modelsTried).toEqual(["gemini-2.5-flash", "gemini-2.5-flash-lite"]);
+    expect(result).toBe("Generated successfully on gemini-2.5-flash-lite");
+  });
 });
+
 

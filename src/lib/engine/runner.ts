@@ -4,6 +4,7 @@ import { resolveProvider, getPlatformTextCandidates, type Funding } from "./cred
 import { stageAnalyze, stageBible, stageChapter } from "./stages";
 import { publicError } from "@/lib/api";
 import { ProviderError, type ProviderName } from "@/lib/ai";
+import { MODELS } from "@/lib/ai/config";
 
 export type JobType = "analyze" | "bible" | "chapter";
 
@@ -78,8 +79,8 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
     .update({ status: "failed", error_code: "timeout", error_message: "That took too long and was stopped. Please try again." })
     .eq("project_id", a.projectId)
     .eq("user_id", a.userId)
-    .in("status", ["queued", "running"])
-    .lt("updated_at", new Date(Date.now() - 10 * 60_000).toISOString());
+    .in("status", ["queued", "running", "paused"])
+    .lt("updated_at", new Date(Date.now() - 5 * 60_000).toISOString());
 
   let chapterId: string | null = null;
   if (a.type === "chapter") {
@@ -112,6 +113,19 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
     }
   }
 
+  // Clear any existing paused/stale job for this chapter or project so retry works immediately
+  const existingJobQuery = admin
+    .from("generation_jobs")
+    .update({ status: "failed" })
+    .eq("project_id", a.projectId)
+    .eq("user_id", a.userId)
+    .eq("status", "paused");
+  if (chapterId) {
+    await existingJobQuery.eq("chapter_id", chapterId);
+  } else {
+    await existingJobQuery.eq("type", a.type);
+  }
+
   const { data: job, error } = await admin
     .from("generation_jobs")
     .insert({
@@ -142,15 +156,19 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
         await set({ provider: name });
 
         const start = Date.now();
-        if (a.type === "analyze") await stageAnalyze(admin, provider, a.userId, a.projectId);
-        else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
-        else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
+        let stepRes: any = null;
+        if (a.type === "analyze") stepRes = await stageAnalyze(admin, provider, a.userId, a.projectId);
+        else if (a.type === "bible") stepRes = await stageBible(admin, provider, a.userId, a.projectId);
+        else stepRes = await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
 
         const durationMs = Date.now() - start;
+        const usedModel = (provider as any).lastModelUsed || (name === "gemini" ? MODELS.gemini.text : undefined);
         telemetryEntries.push({
           step: a.type,
           provider: name,
+          model: usedModel,
           durationMs,
+          callsCount: stepRes?.callsCount ?? 1,
           failoverCount: 0,
         });
 
@@ -188,17 +206,21 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
           const start = Date.now();
 
           try {
-            if (a.type === "analyze") await stageAnalyze(admin, provider, a.userId, a.projectId);
-            else if (a.type === "bible") await stageBible(admin, provider, a.userId, a.projectId);
-            else await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
+            let stepRes: any = null;
+            if (a.type === "analyze") stepRes = await stageAnalyze(admin, provider, a.userId, a.projectId);
+            else if (a.type === "bible") stepRes = await stageBible(admin, provider, a.userId, a.projectId);
+            else stepRes = await stageChapter(admin, provider, a.userId, a.projectId, a.chapterNumber!);
 
             const durationMs = Date.now() - start;
             successfulProvider = name;
+            const usedModel = (provider as any).lastModelUsed || (name === "gemini" ? MODELS.gemini.text : undefined);
 
             telemetryEntries.push({
               step: a.type,
               provider: name,
+              model: usedModel,
               durationMs,
+              callsCount: stepRes?.callsCount ?? 1,
               failoverCount: i,
               failovers,
             });
@@ -245,7 +267,7 @@ export async function createJob(a: StartArgs): Promise<{ jobId: string; run: () 
         });
       }
     } catch (e: any) {
-      const { code, message } = publicError(e);
+      const { code, message } = publicError(e, "text");
       console.error("job failed", job.id, a.type, code, e?.message || e);
       if (e?.stack) console.error(e.stack);
       // A failed free chapter must not use up the allowance.

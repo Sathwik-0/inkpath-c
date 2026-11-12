@@ -24,8 +24,12 @@ export function isUuid(v: string) {
 }
 
 /** Safe text for the UI from any thrown error. Never includes key material. */
-export function publicError(e: unknown): { code: string; message: string } {
-  if (e instanceof ProviderError) return { code: e.code, message: userMessage(e.code) };
+export function publicError(e: unknown, task: "text" | "image" = "text"): { code: string; message: string } {
+  if (e instanceof ProviderError) {
+    const isGenericError = /returned an error \(\d+\)|returned an unreadable response|returned no text/i.test(e.message);
+    const message = e.message && !isGenericError ? e.message : userMessage(e.code, "the provider", task);
+    return { code: e.code, message };
+  }
   if (e instanceof Error && ["NoProviderError", "PlatformPausedError"].includes(e.name))
     return { code: e.name === "PlatformPausedError" ? "platform_paused" : "no_provider", message: e.message };
   return { code: "internal", message: "Something went wrong. Please try again." };

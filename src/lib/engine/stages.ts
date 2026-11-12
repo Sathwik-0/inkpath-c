@@ -1,6 +1,7 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { AIProvider } from "@/lib/ai";
+import { MODELS } from "@/lib/ai/config";
 import { NEW_STATE, applyReview, levelFor, type MemoryState } from "@/lib/learning/scheduler";
 import { planChapter, type ChapterBrief } from "@/lib/learning/planner";
 import { sourceBlock } from "./prompts";
@@ -432,16 +433,21 @@ export async function stageChapter(
   };
   const required = brief.newConcepts.map((c) => c.name);
 
-  const draft = (fix?: string | null) =>
-    provider.generateJson({
+  let callsCount = 0;
+
+  const draft = (fix?: string | null) => {
+    callsCount++;
+    return provider.generateJson({
       system: CHAPTER_SYSTEM,
       prompt: buildChapterPrompt({ ...basePrompt, fixInstructions: fix }),
       parse: (raw) => ChapterSchema.parse(raw),
       maxOutputTokens: 8000,
       temperature: 0.85,
     });
+  };
 
   const verify = (ch: Chapter) => {
+    callsCount++;
     const fullText = ch.scenes.map((s) => s.text).join("\n\n");
     const stockPhrases = findStockPhrases(fullText);
     const hasInTextCitations = /\[(?:S?\d+|p(?:age)?\.?\s*\d+)\]/i.test(fullText);
@@ -495,10 +501,11 @@ export async function stageChapter(
     teaches: s.teaches && s.teaches.length > 0 ? s.teaches : s.concepts_applied || [],
   }));
 
-  // Part B.9: Trim pass if over 15% above target
+  // Part B.9: Trim pass ONLY if word count exceeds target by > 20% on initial draft
   let wordCount = countWords(chapter);
-  if (wordCount > targetWords * 1.15) {
+  if (wordCount > targetWords * 1.2) {
     try {
+      callsCount++;
       const trimmed = await provider.generateJson({
         system: TRIM_SYSTEM,
         prompt: `TARGET WORDS: ${targetWords}\nCURRENT WORDS: ${wordCount}\n\nCHAPTER TO TRIM:\n${JSON.stringify(chapter)}\n\n${CHAPTER_SYSTEM}`,
@@ -528,36 +535,22 @@ export async function stageChapter(
     check.problems.length === 0;
 
   if (!verified) {
-    // One revision pass with specific fix instructions (Part C.5)
+    // Exactly ONE revision pass with specific fix instructions (never run more than one rewrite)
     const fixNotes = check.fix_instructions || check.problems.map((p) => p.issue).join(" | ");
     const revised = await draft(fixNotes);
     revised.scenes = revised.scenes.map((s) => ({
       ...s,
       text: sanitizeStoryProse(s.text),
+      teaches: s.teaches && s.teaches.length > 0 ? s.teaches : s.concepts_applied || [],
     }));
-
-    // Check trimmed on revision as well
-    if (countWords(revised) > targetWords * 1.15) {
-      try {
-        const trimmed = await provider.generateJson({
-          system: TRIM_SYSTEM,
-          prompt: `TARGET WORDS: ${targetWords}\n\nCHAPTER TO TRIM:\n${JSON.stringify(revised)}`,
-          parse: (raw) => ChapterSchema.parse(raw),
-          maxOutputTokens: 8000,
-          temperature: 0.3,
-        });
-        revised.scenes = trimmed.scenes.map((s) => ({
-          ...s,
-          text: sanitizeStoryProse(s.text),
-        }));
-      } catch {}
-    }
 
     const recheck = await verify(revised);
     chapter = revised;
     check = recheck;
     verified = recheck.accurate && recheck.every_concept_acted_on && (recheck.continuity_clean ?? true) && recheck.problems.length === 0;
   }
+
+  const modelUsed = (provider as any).lastModelUsed || (provider.name === "gemini" ? MODELS.gemini.text : undefined);
 
   // Persist the chapter, story memory and learner state
   await admin
@@ -567,7 +560,7 @@ export async function stageChapter(
       summary: chapter.summary,
       prose: { scenes: chapter.scenes },
       hook: brief.isFinal ? null : chapter.hook,
-      brief: { ...brief, provider: provider.name },
+      brief: { ...brief, provider: provider.name, model: modelUsed, callsCount },
       verified,
       verify_notes: verified ? null : check.problems.map((p) => p.issue).join(" | ").slice(0, 1000),
       status: "ready",
@@ -629,29 +622,50 @@ export async function stageChapter(
     futureConcepts.join(", ") || "none"
   }\n\n${notes ? `REVISION NOTES:\n${notes}\n\n` : ""}${RECALL_SHAPE}`;
 
-  let recall = await provider.generateJson({
-    system: RECALL_SYSTEM,
-    prompt: recallPrompt(),
-    parse: (raw) => RecallSchema.parse(raw),
-    maxOutputTokens: 4000,
-    temperature: 0.3,
-  });
+  // Check if merged recall_questions in chapter output are already valid to save an extra call
+  let questionsToUse: any[] | null = null;
+  if (chapter.recall_questions && chapter.recall_questions.length > 0) {
+    const directValidation = validateRecallQuestions(
+      { questions: chapter.recall_questions },
+      chapterFullText,
+      taughtNames,
+      futureConcepts,
+    );
+    if (directValidation.valid) {
+      questionsToUse = chapter.recall_questions;
+    }
+  }
 
-  // Validate questions have evidence and only test taught concepts (Part D.3)
-  const validation = validateRecallQuestions(recall, chapterFullText, taughtNames, futureConcepts);
-  if (!validation.valid) {
-    // Regenerate once with feedback
-    recall = await provider.generateJson({
+  if (!questionsToUse) {
+    callsCount++;
+    let recall = await provider.generateJson({
       system: RECALL_SYSTEM,
-      prompt: recallPrompt(`PREVIOUS QUESTIONS REJECTED: ${validation.reason}. Every question MUST include valid evidence directly from the chapter text and test only concepts in this chapter.`),
+      prompt: recallPrompt(),
       parse: (raw) => RecallSchema.parse(raw),
       maxOutputTokens: 4000,
-      temperature: 0.2,
+      temperature: 0.3,
     });
+
+    // Validate questions have evidence and only test taught concepts (Part D.3)
+    const validation = validateRecallQuestions(recall, chapterFullText, taughtNames, futureConcepts);
+    if (!validation.valid) {
+      callsCount++;
+      // Regenerate once with feedback
+      recall = await provider.generateJson({
+        system: RECALL_SYSTEM,
+        prompt: recallPrompt(
+          `PREVIOUS QUESTIONS REJECTED: ${validation.reason}. Every question MUST include valid evidence directly from the chapter text and test only concepts in this chapter.`,
+        ),
+        parse: (raw) => RecallSchema.parse(raw),
+        maxOutputTokens: 4000,
+        temperature: 0.2,
+      });
+    }
+    questionsToUse = recall.questions;
   }
 
   // Attach concept source quote and chapter evidence to questions
-  const questionsWithSources = recall.questions.map((q) => {
+  const questionsWithSources = questionsToUse.map((q) => {
     const cDetails = conceptDetails[q.concept_name];
     const sourceQuote = q.source_quote || cDetails?.citations?.[0]?.quote || undefined;
     return {
@@ -665,7 +679,7 @@ export async function stageChapter(
     { onConflict: "chapter_id" },
   );
 
-  return { chapterId: chapterRow.id, verified, newConcepts: required, reviews: brief.reviewConcepts.map((c) => c.name) };
+  return { chapterId: chapterRow.id, verified, newConcepts: required, reviews: brief.reviewConcepts.map((c) => c.name), callsCount };
 }
 
 /* ------------------------------------------------------------- 4. recall */

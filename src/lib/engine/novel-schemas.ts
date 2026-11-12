@@ -79,6 +79,16 @@ export const BibleSchema = z.object({
 });
 export type Bible = z.infer<typeof BibleSchema>;
 
+export const QuestionSchema = z.object({
+  prompt: text(400),
+  options: z.array(z.string().transform((s) => s.trim().slice(0, 200))).min(2).max(5),
+  correct_index: num.min(0),
+  explanation: text(500),
+  concept_name: text(120),
+  evidence: text(400).default(""),
+  source_quote: optText(400),
+});
+
 /** Step 3: one chapter of prose. */
 export const ChapterSchema = z.object({
   title: text(160),
@@ -103,6 +113,7 @@ export const ChapterSchema = z.object({
     .array(z.object({ label: text(200), concept_name: optText(120), due_by: num.min(1).nullish() }))
     .default([]),
   paid_off_threads: list,
+  recall_questions: z.array(QuestionSchema).optional(),
 });
 export type Chapter = z.infer<typeof ChapterSchema>;
 
@@ -120,17 +131,7 @@ export type Verification = z.infer<typeof VerifySchema>;
 
 export const RecallSchema = z.object({
   questions: z
-    .array(
-      z.object({
-        prompt: text(400),
-        options: z.array(z.string().transform((s) => s.trim().slice(0, 200))).min(2).max(5),
-        correct_index: num.min(0),
-        explanation: text(500),
-        concept_name: text(120),
-        evidence: text(400).default(""),
-        source_quote: optText(400),
-      }),
-    )
+    .array(QuestionSchema)
     .min(1)
     .max(8)
     .refine((qs) => qs.every((q) => q.correct_index < q.options.length), {

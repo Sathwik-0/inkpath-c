@@ -11,7 +11,14 @@
 export const MODELS = {
   gemini: {
     get text() {
-      return process.env.GEMINI_TEXT_MODEL || "gemini-3.8-flash";
+      return process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
+    },
+    get textFallbacks(): string[] {
+      const raw = process.env.GEMINI_TEXT_MODEL_FALLBACKS || "gemini-2.5-flash-lite,gemini-2.5-pro";
+      return raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     },
     get image() {
       return process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
